@@ -1363,8 +1363,8 @@ class StickyNote : Form {
 
 // ====================== Quick search (Win+Space) ======================
 class SearchItem {
-    public string Name, Path, Keywords = "";
-    public bool Setting;
+    public string Name, Path, Keywords = "", Kind = "App";
+    public bool Setting, Custom;   // Custom = something the user put in "Thinbar Search"
     public Bitmap Icon;
 }
 
@@ -1441,6 +1441,46 @@ static class AppIndex {
         }
     }
 
+    // Documents\Thinbar Search: anything put here (files, folders, shortcuts, also inside sub-folders) shows up in search.
+    public static string CustomDir() {
+        return System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Thinbar Search");
+    }
+    public static List<SearchItem> LoadCustom(int iconPx) {
+        List<SearchItem> list = new List<SearchItem>();
+        string root = CustomDir();
+        try {
+            if (!Directory.Exists(root)) Directory.CreateDirectory(root);
+            Queue<string> dirs = new Queue<string>();
+            dirs.Enqueue(root);
+            int depth0 = root.TrimEnd('\\').Split('\\').Length;
+            while (dirs.Count > 0 && list.Count < 2000) {
+                string d = dirs.Dequeue();
+                string[] subs = new string[0], files = new string[0];
+                try { subs = Directory.GetDirectories(d); files = Directory.GetFiles(d); } catch { continue; }
+                foreach (string sd in subs) {
+                    FileAttributes fa = File.GetAttributes(sd);
+                    if ((fa & FileAttributes.Hidden) != 0) continue;
+                    list.Add(Custom(sd, System.IO.Path.GetFileName(sd), "Folder", iconPx));
+                    if (sd.TrimEnd('\\').Split('\\').Length - depth0 < 4) dirs.Enqueue(sd);   // up to 4 levels deep
+                }
+                foreach (string f in files) {
+                    FileAttributes fa = File.GetAttributes(f);
+                    if ((fa & (FileAttributes.Hidden | FileAttributes.System)) != 0) continue;
+                    string ext = System.IO.Path.GetExtension(f).ToLowerInvariant();
+                    bool shortcut = ext == ".lnk" || ext == ".url" || ext == ".exe";
+                    string name = shortcut ? System.IO.Path.GetFileNameWithoutExtension(f) : System.IO.Path.GetFileName(f);
+                    list.Add(Custom(f, name, shortcut ? "Shortcut" : "File", iconPx));
+                }
+            }
+        } catch (Exception ex) { Log.Write("custom search folder: " + ex.Message); }
+        return list;
+    }
+    static SearchItem Custom(string path, string name, string kind, int iconPx) {
+        SearchItem s = new SearchItem(); s.Name = name; s.Path = path; s.Kind = kind; s.Custom = true;
+        s.Icon = ShellIcon(path, iconPx);
+        return s;
+    }
+
     public static List<SearchItem> Settings() {
         string[,] s = {
             { "Display", "display", "screen resolution scale brightness monitor" },
@@ -1500,7 +1540,7 @@ static class AppIndex {
         };
         List<SearchItem> list = new List<SearchItem>();
         for (int i = 0; i < s.GetLength(0); i++) {
-            SearchItem it = new SearchItem(); it.Name = s[i, 0]; it.Path = "ms-settings:" + s[i, 1]; it.Keywords = s[i, 2]; it.Setting = true;
+            SearchItem it = new SearchItem(); it.Name = s[i, 0]; it.Path = "ms-settings:" + s[i, 1]; it.Keywords = s[i, 2]; it.Setting = true; it.Kind = "Settings";
             list.Add(it);
         }
         return list;
@@ -1522,7 +1562,8 @@ static class AppIndex {
                 foreach (string k in it.Keywords.Split(' ')) if (k.StartsWith(q)) { sc = 300; break; }
             }
         }
-        if (sc > 0 && !it.Setting) sc += 50;   // apps before settings when equally good
+        if (sc > 0 && it.Custom) sc += 80;          // your own items first
+        else if (sc > 0 && !it.Setting) sc += 50;   // then apps, then settings
         return sc;
     }
 }
@@ -1539,7 +1580,8 @@ class Launcher : Form {
     float sc; int Wd, pad, boxH, rowH, maxRows, iconPx;
     TextBox tb;
     Font fBox, fName, fKind, fIcon;
-    List<SearchItem> apps = new List<SearchItem>(), settings;
+    List<SearchItem> apps = new List<SearchItem>(), custom = new List<SearchItem>(), settings;
+    FileSystemWatcher fsw; volatile bool customDirty;
     List<SearchItem> results = new List<SearchItem>();
     int sel, hover = -1;
     bool deleting, filling, loading, wasFront;
@@ -1561,13 +1603,24 @@ class Launcher : Form {
         fKind = new Font("Segoe UI", 8.5f);
         fIcon = new Font("Segoe MDL2 Assets", 13f);
         settings = AppIndex.Settings();
+        try {
+            string cd = AppIndex.CustomDir();
+            if (!Directory.Exists(cd)) Directory.CreateDirectory(cd);
+            fsw = new FileSystemWatcher(cd);
+            fsw.IncludeSubdirectories = true;
+            fsw.NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName;
+            FileSystemEventHandler mark = delegate { customDirty = true; };
+            fsw.Created += mark; fsw.Deleted += mark;
+            fsw.Renamed += delegate { customDirty = true; };
+            fsw.EnableRaisingEvents = true;
+        } catch (Exception ex) { Log.Write("custom search watcher: " + ex.Message); }
 
         tb = new TextBox();
         tb.BorderStyle = BorderStyle.None;
         tb.BackColor = BOX; tb.ForeColor = FG; tb.Font = fBox;
         tb.Location = new Point(pad + (int)(44 * sc), pad + (boxH - tb.PreferredHeight) / 2);
         tb.Width = Wd - 2 * pad - (int)(56 * sc);
-        tb.HandleCreated += delegate { Native.SendMessageStr(tb.Handle, 0x1501, (IntPtr)1, "Search apps and settings"); };   // EM_SETCUEBANNER
+        tb.HandleCreated += delegate { Native.SendMessageStr(tb.Handle, 0x1501, (IntPtr)1, "Search apps, settings and your Thinbar Search folder"); };   // EM_SETCUEBANNER
         tb.KeyDown += TbKey;
         tb.TextChanged += delegate { OnQuery(); };
         Controls.Add(tb);
@@ -1598,14 +1651,17 @@ class Launcher : Form {
 
     // ---------- index (built in the background; the old list is used meanwhile) ----------
     public void Refresh(bool force) {
+        if (customDirty) force = true;
         if (loading || (!force && (DateTime.UtcNow - loadedAt).TotalSeconds < 120)) return;
-        loading = true;
+        loading = true; customDirty = false;
         Thread th = new Thread(delegate() {
             List<SearchItem> list = AppIndex.LoadApps(iconPx);
+            List<SearchItem> mine = AppIndex.LoadCustom(iconPx);
             try {
                 BeginInvoke(new Action(delegate {
                     foreach (SearchItem o in apps) if (o.Icon != null) o.Icon.Dispose();
-                    apps = list; loadedAt = DateTime.UtcNow; loading = false;
+                    foreach (SearchItem o in custom) if (o.Icon != null) o.Icon.Dispose();
+                    apps = list; custom = mine; loadedAt = DateTime.UtcNow; loading = false;
                     if (Visible) OnQuery();
                 }));
             } catch { loading = false; }
@@ -1645,6 +1701,7 @@ class Launcher : Form {
         string q = Query();
         List<KeyValuePair<int, SearchItem>> hits = new List<KeyValuePair<int, SearchItem>>();
         if (q.Length > 0) {
+            foreach (SearchItem it in custom) { int s = AppIndex.Score(it, q); if (s > 0) hits.Add(new KeyValuePair<int, SearchItem>(s, it)); }
             foreach (SearchItem it in apps) { int s = AppIndex.Score(it, q); if (s > 0) hits.Add(new KeyValuePair<int, SearchItem>(s, it)); }
             foreach (SearchItem it in settings) { int s = AppIndex.Score(it, q); if (s > 0) hits.Add(new KeyValuePair<int, SearchItem>(s, it)); }
             hits.Sort(delegate(KeyValuePair<int, SearchItem> a, KeyValuePair<int, SearchItem> b) {
@@ -1694,7 +1751,7 @@ class Launcher : Form {
     void Open(SearchItem it) {
         Hide();
         try {
-            ProcessStartInfo psi = it.Setting ? new ProcessStartInfo(it.Path) : new ProcessStartInfo("explorer.exe", "shell:AppsFolder\\" + it.Path);
+            ProcessStartInfo psi = (it.Setting || it.Custom) ? new ProcessStartInfo(it.Path) : new ProcessStartInfo("explorer.exe", "shell:AppsFolder\\" + it.Path);
             psi.UseShellExecute = true;
             Process.Start(psi);
         } catch (Exception ex) { Log.Write("launch " + it.Name + ": " + ex.Message); }
@@ -1726,7 +1783,7 @@ class Launcher : Form {
             if (it.Setting) TextRenderer.DrawText(g, "\uE713", fIcon, ir, FG, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
             else if (it.Icon != null) g.DrawImage(it.Icon, ir);
             int tx = ir.Right + (int)(12 * sc);
-            string kind = it.Setting ? "Settings" : "App";
+            string kind = it.Kind;
             Size ks = TextRenderer.MeasureText(kind, fKind);
             TextRenderer.DrawText(g, it.Name, fName, new Rectangle(tx, r.Y, r.Right - tx - ks.Width - (int)(20 * sc), r.Height), FG, tf);
             TextRenderer.DrawText(g, kind, fKind, new Rectangle(r.Right - ks.Width - (int)(12 * sc), r.Y, ks.Width + 4, r.Height), DIM, tf);
@@ -2794,6 +2851,9 @@ class Bar : Form {
         m.Add(MI(null, "Show desktop", delegate { Key2(0x5B, 0x44); }));
         m.Add(MI(showStats ? "\uE73E" : null, "Show CPU and RAM", delegate { showStats = !showStats; SaveSettings(); Invalidate(); }));
         m.Add(MI(searchKey ? "\uE73E" : null, "Win+Space search", delegate { searchKey = !searchKey; SetSearchKey(searchKey); SaveSettings(); }));
+        m.Add(MI("\uE838", "Open Thinbar Search folder", delegate {
+            try { string cd = AppIndex.CustomDir(); Directory.CreateDirectory(cd); Process.Start("explorer.exe", "\"" + cd + "\""); } catch { }
+        }));
         m.Add(SepItem());
         m.Add(MI("\uE711", "Exit Fable Thin Bar", delegate { Close(); }));
         OpenPop(m);
@@ -3235,6 +3295,9 @@ if (Test-Path $oldDir) {
     Remove-ItemProperty -Path $runKey -Name ThinBar -ErrorAction SilentlyContinue
     Remove-Item (Join-Path ([Environment]::GetFolderPath('Startup')) 'ThinBar.lnk') -Force -ErrorAction SilentlyContinue
 }
+
+# Search folder: anything put in Documents\Thinbar Search shows up in Win+Space search (kept on uninstall)
+New-Item -ItemType Directory -Force -Path (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Thinbar Search') | Out-Null
 
 # App icon (embedded so the script stays a single file)
 [IO.File]::WriteAllBytes($ico, [Convert]::FromBase64String($iconB64))
