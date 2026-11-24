@@ -780,8 +780,8 @@ class TapeForm : Form {
 // A small paper sticky note that lives on the desktop: title, date, checklist.
 // Hit kinds: 1 checkbox, 2 task text, 3 add-task row, 4 title, 5 pin, 6 new note, 7 minimize, 8 delete, 9 clear done
 class StickyNote : Form {
-    static readonly Color[] PA = { Color.FromArgb(255, 236, 130), Color.FromArgb(255, 207, 220), Color.FromArgb(192, 228, 252), Color.FromArgb(210, 242, 192), Color.FromArgb(228, 214, 250) };
-    static readonly Color[] PB = { Color.FromArgb(250, 220, 96), Color.FromArgb(247, 184, 202), Color.FromArgb(160, 208, 242), Color.FromArgb(184, 228, 160), Color.FromArgb(206, 190, 240) };
+    static readonly Color[] PA = { Color.FromArgb(255, 250, 243), Color.FromArgb(255, 236, 130), Color.FromArgb(255, 207, 220), Color.FromArgb(192, 228, 252), Color.FromArgb(210, 242, 192), Color.FromArgb(228, 214, 250) };
+    static readonly Color[] PB = { Color.FromArgb(253, 245, 234), Color.FromArgb(250, 220, 96), Color.FromArgb(247, 184, 202), Color.FromArgb(160, 208, 242), Color.FromArgb(184, 228, 160), Color.FromArgb(206, 190, 240) };
     static readonly Color INK = Color.FromArgb(44, 40, 78);
     static readonly Color FAINT = Color.FromArgb(125, 118, 120);
     static readonly Color RED = Color.FromArgb(222, 70, 70);
@@ -914,39 +914,27 @@ class StickyNote : Form {
         get { CreateParams cp = base.CreateParams; cp.ExStyle |= 0x80; return cp; }   // tool window: no taskbar button / Alt+Tab entry
     }
 
-    // ---------- shape: torn left edge with binder holes, and a strip of tape on top ----------
+    // ---------- shape: a plain card with a paperclip on the top-left ----------
+    // The clip is drawn in its own see-through window (so it can stick out above the card).
     GraphicsPath TapePath() {
-        float cx = Wn * 0.42f, cy = PTop - 1 * sc, w = 104 * sc, h = 28 * sc;
-        float l = cx - w / 2, r = cx + w / 2, t = cy - h / 2, b = cy + h / 2, z = 2.5f * sc;
-        PointF[] p = {
-            new PointF(l, t), new PointF(r, t), new PointF(r - z, t + h * 0.25f), new PointF(r, t + h * 0.5f), new PointF(r - z, t + h * 0.75f),
-            new PointF(r, b), new PointF(l, b), new PointF(l + z, t + h * 0.75f), new PointF(l, t + h * 0.5f), new PointF(l + z, t + h * 0.25f) };
+        float u = 1.05f * sc, x0 = 16 * sc, y0 = PTop - 11 * sc;
         GraphicsPath gp = new GraphicsPath();
-        gp.AddPolygon(p);
-        using (Matrix m = new Matrix()) { m.RotateAt(-3f, new PointF(cx, cy)); gp.Transform(m); }
+        gp.StartFigure();
+        gp.AddLine(x0 + 5 * u, y0 + 11 * u, x0 + 5 * u, y0 + 25 * u);         // inner wire, down
+        gp.AddArc(x0 + 5 * u, y0 + 22.5f * u, 5 * u, 5 * u, 180, -180);         // small bottom loop
+        gp.AddLine(x0 + 10 * u, y0 + 25 * u, x0 + 10 * u, y0 + 5 * u);         // up
+        gp.AddArc(x0 + 0 * u, y0 + 0 * u, 10 * u, 10 * u, 0, -180);             // top loop
+        gp.AddLine(x0 + 0 * u, y0 + 5 * u, x0 + 0 * u, y0 + 29 * u);           // outer wire, down
+        gp.AddArc(x0 + 0 * u, y0 + 23 * u, 13 * u, 13 * u, 180, -180);          // big bottom loop
+        gp.AddLine(x0 + 13 * u, y0 + 29.5f * u, x0 + 13 * u, y0 + 14 * u);     // up, ends inside
         return gp;
     }
     void BuildShape() {
-        Random rnd = new Random(D.Seed);
-        List<PointF> pts = new List<PointF>();
-        float step = 7 * sc;
-        pts.Add(new PointF(Wn, PTop));
-        pts.Add(new PointF(2 * sc + (float)rnd.NextDouble() * 5 * sc, PTop));
-        for (float y = PTop + step; y < Hn - step; y += step) pts.Add(new PointF((1f + (float)rnd.NextDouble() * 6f) * sc, y));
-        pts.Add(new PointF(2 * sc, Hn));
-        pts.Add(new PointF(Wn, Hn));
-        edge = pts.ToArray();
+        edge = null;
         tapeP = TapePath();
         RectangleF tb0 = tapeP.GetBounds();
-        tapeOff = new Point((int)Math.Floor(tb0.X) - 2, (int)Math.Floor(tb0.Y) - 2);
-        using (GraphicsPath paper = new GraphicsPath()) {
-            paper.AddPolygon(edge);
-            Region reg = new Region(paper);
-            for (float y = PTop + 40 * sc; y < Hn - 20 * sc; y += 46 * sc) {
-                using (GraphicsPath hole = new GraphicsPath()) { hole.AddEllipse(-4 * sc, y - 5 * sc, 10 * sc, 10 * sc); reg.Exclude(hole); }
-            }
-            Region = reg;
-        }
+        tapeOff = new Point((int)Math.Floor(tb0.X) - 4, (int)Math.Floor(tb0.Y) - 4);
+        Region = new Region(new Rectangle(0, PTop, Wn, Hn - PTop));
     }
 
     // ---------- painting ----------
@@ -997,21 +985,16 @@ class StickyNote : Form {
         using (LinearGradientBrush pb = new LinearGradientBrush(new Rectangle(0, 0, Wn, Hn + 1), PA[ci], PB[ci], LinearGradientMode.Vertical)) g.FillRectangle(pb, paper);
         if (grain != null) using (TextureBrush tb = new TextureBrush(grain)) g.FillRectangle(tb, paper);
 
-        // ruled lines + red margin line
+        // ruled lines: thin blue, inset from both sides
         g.SmoothingMode = SmoothingMode.None;
-        using (Pen lp = new Pen(Color.FromArgb(78, 90, 105, 150), 1f)) {
-            for (int y = rowsTop; y < Hn - 4; y += RH) g.DrawLine(lp, (int)(6 * sc), y, Wn, y);
-            for (int y = rowsTop - RH; y > PTop + (int)(30 * sc); y -= RH) g.DrawLine(lp, (int)(6 * sc), y, Wn, y);
+        int lx0 = (int)(10 * sc), lx1 = Wn - (int)(10 * sc);
+        using (Pen lp = new Pen(Color.FromArgb(150, 96, 128, 226), 1f)) {
+            for (int y = rowsTop; y < Hn - (int)(8 * sc); y += RH) g.DrawLine(lp, lx0, y, lx1, y);
+            for (int y = rowsTop - RH; y > PTop + (int)(30 * sc); y -= RH) g.DrawLine(lp, lx0, y, lx1, y);
         }
+        // a faint edge so the card reads on light wallpapers too
+        using (Pen bp = new Pen(Color.FromArgb(40, 60, 40, 20), 1f)) g.DrawRectangle(bp, 0, PTop, Wn - 1, Hn - PTop - 1);
         g.SmoothingMode = SmoothingMode.AntiAlias;
-        using (Pen mp = new Pen(Color.FromArgb(215, 226, 108, 96), 1.5f * sc)) g.DrawLine(mp, 38 * sc, PTop, 38 * sc, Hn);
-
-        // torn edge outline
-        if (edge != null && edge.Length > 3) {
-            PointF[] left = new PointF[edge.Length - 2];
-            Array.Copy(edge, 1, left, 0, left.Length);
-            using (Pen ep = new Pen(Color.FromArgb(95, 130, 95, 20), 1f)) g.DrawLines(ep, left);
-        }
         // header icons: pin, new note, minimize, delete
         int ic = (int)(20 * sc), y0 = PTop + (int)(5 * sc), xr = Wn - (int)(10 * sc), ig = (int)(3 * sc);
         Rectangle rClose = new Rectangle(xr - ic, y0, ic, ic);
@@ -1286,15 +1269,21 @@ class StickyNote : Form {
             if (tape == null) {
                 tape = new TapeForm();
                 RectangleF tb = tapeP.GetBounds();
-                int w = (int)Math.Ceiling(tb.Right) - tapeOff.X + 2, h = (int)Math.Ceiling(tb.Bottom) - tapeOff.Y + 2;
+                int w = (int)Math.Ceiling(tb.Right) - tapeOff.X + 6, h = (int)Math.Ceiling(tb.Bottom) - tapeOff.Y + 6;
                 Bitmap bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb);
                 using (Graphics g = Graphics.FromImage(bmp)) {
                     g.SmoothingMode = SmoothingMode.AntiAlias;
                     using (GraphicsPath tp = (GraphicsPath)tapeP.Clone()) using (Matrix m = new Matrix()) {
                         m.Translate(-tapeOff.X, -tapeOff.Y);
                         tp.Transform(m);
-                        using (SolidBrush fb = new SolidBrush(Color.FromArgb(112, 232, 226, 208))) g.FillPath(fb, tp);   // translucent
-                        using (Pen bp = new Pen(Color.FromArgb(95, 120, 110, 90), 1f)) g.DrawPath(bp, tp);
+                        using (Pen sh = new Pen(Color.FromArgb(55, 60, 30, 10), 2.4f * sc)) {   // soft shadow
+                            sh.StartCap = LineCap.Round; sh.EndCap = LineCap.Round; sh.LineJoin = LineJoin.Round;
+                            using (Matrix sm = new Matrix()) { sm.Translate(1f * sc, 1.2f * sc); using (GraphicsPath sp = (GraphicsPath)tp.Clone()) { sp.Transform(sm); g.DrawPath(sh, sp); } }
+                        }
+                        using (Pen cp = new Pen(Color.FromArgb(255, 214, 84, 40), 2.1f * sc)) {   // orange wire
+                            cp.StartCap = LineCap.Round; cp.EndCap = LineCap.Round; cp.LineJoin = LineJoin.Round;
+                            g.DrawPath(cp, tp);
+                        }
                     }
                 }
                 tape.Show(this);

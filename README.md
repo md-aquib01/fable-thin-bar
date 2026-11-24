@@ -15,7 +15,7 @@ No installer and no third-party software: it builds a small app with the C# comp
 
 - **Thin 28 px bar** that replaces the built-in taskbar (the real one is hidden, not removed).
 - **Solid, translucent or transparent** look: right-click an empty part of the bar to switch.
-- **Sticky-note widget**: paper notes on the desktop with tasks and plain text, word wrap, colours, keep-on-top, minimise and delete.
+- **Sticky-note widget**: cream paper notes with a paperclip, on the desktop, with tasks and plain text, word wrap, colours, keep-on-top, minimise and delete.
 - **Clipboard** button that opens Windows clipboard history (Win+V).
 - **CPU and RAM usage** right on the bar; click it to open **Task Manager**.
 - **On/off options**: turn the CPU and RAM readout on or off, and exit the bar from its right-click menu.
