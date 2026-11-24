@@ -29,15 +29,12 @@ No installer and no third-party software: it builds a small app with the C# comp
 **Solid**
 ![Solid bar](assets/screenshots/bar-solid.png)
 
-**Translucent**
-![Translucent bar](assets/screenshots/bar-translucent.png)
 
 **Transparent**
 ![Transparent bar](assets/screenshots/bar-transparent.png)
 
 <p>
   <img src="assets/screenshots/sticky-note.png" width="300" alt="Sticky-note widget">
-  <img src="assets/screenshots/tray.png" width="420" alt="Hidden tray icons above the arrow">
 </p>
 
 ## Install
