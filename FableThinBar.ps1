@@ -1585,6 +1585,7 @@ class Launcher : Form {
     List<SearchItem> results = new List<SearchItem>();
     int sel, hover = -1;
     bool deleting, filling, loading, wasFront;
+    int shownAt, focusTries;
     DateTime loadedAt = DateTime.MinValue;
     System.Windows.Forms.Timer watch;
 
@@ -1631,11 +1632,15 @@ class Launcher : Form {
         watch.Interval = 40;
         watch.Tick += delegate {
             if (!Visible) { watch.Stop(); return; }
-            bool down = (Native.GetAsyncKeyState(0x01) & 0x8000) != 0 || (Native.GetAsyncKeyState(0x02) & 0x8000) != 0 || (Native.GetAsyncKeyState(0x04) & 0x8000) != 0;
-            if (down && !Bounds.Contains(Cursor.Position)) { Hide(); return; }
             bool front = Native.GetForegroundWindow() == Handle;
+            // Windows sometimes refuses the first attempt to bring us forward: keep trying for about half a second
+            if (!front && !wasFront && focusTries < 12) { focusTries++; ForceFront(); return; }
+            if (front && !tb.Focused) tb.Focus();
             if (front) wasFront = true;
-            else if (wasFront) Hide();
+            if (Environment.TickCount - shownAt < 250) return;   // ignore the moment of opening
+            bool down = (Native.GetAsyncKeyState(0x01) & 0x8000) != 0 || (Native.GetAsyncKeyState(0x02) & 0x8000) != 0 || (Native.GetAsyncKeyState(0x04) & 0x8000) != 0;
+            if (down && !Bounds.Contains(Cursor.Position)) { Hide(); return; }   // click outside
+            if (wasFront && !front) Hide();                                    // something else took over
         };
     }
     protected override void OnVisibleChanged(EventArgs e) {
@@ -1644,10 +1649,9 @@ class Launcher : Form {
     }
 
     protected override CreateParams CreateParams {
-        get { CreateParams cp = base.CreateParams; cp.ExStyle |= 0x80; cp.ClassStyle |= 0x20000; return cp; }   // tool window, drop shadow
+        get { CreateParams cp = base.CreateParams; cp.ExStyle |= 0x80 | 0x8; cp.ClassStyle |= 0x20000; return cp; }   // tool window, always on top, drop shadow
     }
     protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); Ui.Corners(Handle); }
-    protected override void OnDeactivate(EventArgs e) { base.OnDeactivate(e); if (Visible) Hide(); }
 
     // ---------- index (built in the background; the old list is used meanwhile) ----------
     public void Refresh(bool force) {
@@ -1678,10 +1682,17 @@ class Launcher : Form {
         filling = true; tb.Text = ""; filling = false;
         results.Clear(); sel = 0; hover = -1;
         ResizeTo(0);
+        shownAt = Environment.TickCount; focusTries = 0; wasFront = false;
         Show();
-        Bar.Activate(Handle);
+        ForceFront();
         tb.Focus();
         Refresh(false);
+    }
+    void ForceFront() {
+        Native.SetWindowPos(Handle, (IntPtr)(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040);   // HWND_TOPMOST, NOSIZE | NOMOVE | SHOWWINDOW
+        TrayChevron.Keys(0xE8);   // an input event from us lets Windows hand focus over
+        Bar.Activate(Handle);
+        if (Native.GetForegroundWindow() == Handle) tb.Focus();
     }
 
     void ResizeTo(int rows) {
@@ -2809,22 +2820,42 @@ class Bar : Form {
 
     // ---------- Win+Space search ----------
     // A low-level keyboard hook catches Win+Space (Windows normally uses it to switch keyboard language).
+    // The hook lives on its own thread with its own message loop. On the bar's thread it could be slowed by
+    // drawing or window snapshots, and Windows silently removes a keyboard hook that answers too slowly.
+    static volatile bool searchOn;
+    Thread hookThread;
     void SetSearchKey(bool on) {
-        if (on && kbHook == IntPtr.Zero) {
+        searchOn = on;
+        if (!on || hookThread != null) return;
+        hookThread = new Thread(delegate() {
             if (hookProc == null) hookProc = KeyHook;
             kbHook = Native.SetWindowsHookEx(13, hookProc, Native.GetModuleHandle(null), 0);   // WH_KEYBOARD_LL
             if (kbHook == IntPtr.Zero) Log.Write("search: keyboard hook failed");
-        } else if (!on && kbHook != IntPtr.Zero) {
-            Native.UnhookWindowsHookEx(kbHook); kbHook = IntPtr.Zero;
-        }
+            System.Windows.Forms.Timer rehook = new System.Windows.Forms.Timer();
+            rehook.Interval = 5 * 60 * 1000;   // re-install now and then, in case Windows dropped it (e.g. after sleep)
+            rehook.Tick += delegate {
+                IntPtr old = kbHook;
+                kbHook = Native.SetWindowsHookEx(13, hookProc, Native.GetModuleHandle(null), 0);
+                if (old != IntPtr.Zero && kbHook != IntPtr.Zero) Native.UnhookWindowsHookEx(old);
+                else if (kbHook == IntPtr.Zero) kbHook = old;
+            };
+            rehook.Start();
+            Application.Run();   // message loop for the hook
+        });
+        hookThread.IsBackground = true;
+        hookThread.SetApartmentState(ApartmentState.STA);
+        hookThread.Start();
     }
     IntPtr KeyHook(int code, IntPtr w, IntPtr l) {
-        if (code >= 0) {
+        if (code >= 0 && searchOn) {
             int vk = Marshal.ReadInt32(l), flags = Marshal.ReadInt32(l, 8), msg = w.ToInt32();
             if (vk == 0x20 && (flags & 0x10) == 0) {   // Space, typed by a person (not injected)
                 bool win = (Native.GetAsyncKeyState(0x5B) & 0x8000) != 0 || (Native.GetAsyncKeyState(0x5C) & 0x8000) != 0;
                 if ((msg == 0x100 || msg == 0x104) && win) {
-                    if (!swallowSpaceUp) { swallowSpaceUp = true; BeginInvoke(new Action(OpenSearch)); }
+                    if (!swallowSpaceUp) {
+                        swallowSpaceUp = true;   // (no key sending in here: it would wait on this very hook)
+                        try { BeginInvoke(new Action(OpenSearch)); } catch { }
+                    }
                     return (IntPtr)1;   // Windows never sees it
                 }
                 if ((msg == 0x101 || msg == 0x105) && swallowSpaceUp) { swallowSpaceUp = false; return (IntPtr)1; }
