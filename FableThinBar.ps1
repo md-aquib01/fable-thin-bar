@@ -1542,8 +1542,9 @@ class Launcher : Form {
     List<SearchItem> apps = new List<SearchItem>(), settings;
     List<SearchItem> results = new List<SearchItem>();
     int sel, hover = -1;
-    bool deleting, filling, loading;
+    bool deleting, filling, loading, wasFront;
     DateTime loadedAt = DateTime.MinValue;
+    System.Windows.Forms.Timer watch;
 
     public Launcher(float scale) {
         sc = scale;
@@ -1571,6 +1572,22 @@ class Launcher : Form {
         tb.TextChanged += delegate { OnQuery(); };
         Controls.Add(tb);
         ResizeTo(0);
+        // close on any click outside the box, or when another window takes over
+        // (doesn't rely on Windows telling us we lost focus, which it skips if we never fully got it)
+        watch = new System.Windows.Forms.Timer();
+        watch.Interval = 40;
+        watch.Tick += delegate {
+            if (!Visible) { watch.Stop(); return; }
+            bool down = (Native.GetAsyncKeyState(0x01) & 0x8000) != 0 || (Native.GetAsyncKeyState(0x02) & 0x8000) != 0 || (Native.GetAsyncKeyState(0x04) & 0x8000) != 0;
+            if (down && !Bounds.Contains(Cursor.Position)) { Hide(); return; }
+            bool front = Native.GetForegroundWindow() == Handle;
+            if (front) wasFront = true;
+            else if (wasFront) Hide();
+        };
+    }
+    protected override void OnVisibleChanged(EventArgs e) {
+        base.OnVisibleChanged(e);
+        if (Visible) { wasFront = false; watch.Start(); } else watch.Stop();
     }
 
     protected override CreateParams CreateParams {
