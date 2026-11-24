@@ -407,6 +407,10 @@ static class Native {
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool LockWorkStation();
     [DllImport("user32.dll")] public static extern bool ReleaseCapture();
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+    [DllImport("user32.dll")] public static extern void SwitchToThisWindow(IntPtr h, bool altTab);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll")] public static extern uint SendInput(uint n, KINPUT[] inputs, int size);
     [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc p, IntPtr l);
@@ -814,7 +818,7 @@ class StickyNote : Form {
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.Manual;
         Wn = (int)(264 * sc); Hn = (int)(336 * sc); PTop = (int)(18 * sc); RH = (int)(16 * sc);
-        textX = (int)(46 * sc); rowsTop = (int)(80 * sc); rowsBottom = Hn - (int)(40 * sc);
+        textX = (int)(46 * sc); rowsTop = (int)(56 * sc); rowsBottom = Hn - (int)(40 * sc);
         ClientSize = new Size(Wn, Hn);
         BackColor = PA[0];
         TopMost = D.Top;
@@ -995,36 +999,13 @@ class StickyNote : Form {
         // a faint edge so the card reads on light wallpapers too
         using (Pen bp = new Pen(Color.FromArgb(40, 60, 40, 20), 1f)) g.DrawRectangle(bp, 0, PTop, Wn - 1, Hn - PTop - 1);
         g.SmoothingMode = SmoothingMode.AntiAlias;
-        // header icons: pin, new note, minimize, delete
-        int ic = (int)(20 * sc), y0 = PTop + (int)(5 * sc), xr = Wn - (int)(10 * sc), ig = (int)(3 * sc);
-        Rectangle rClose = new Rectangle(xr - ic, y0, ic, ic);
-        Rectangle rMin = new Rectangle(rClose.X - ic - ig, y0, ic, ic);
-        Rectangle rNew = new Rectangle(rMin.X - ic - ig, y0, ic, ic);
-        Rectangle rPin = new Rectangle(rNew.X - ic - ig, y0, ic, ic);
-        DrawHeaderIcon(g, rPin, 5); NH(rPin, 5, 0);
-        DrawHeaderIcon(g, rNew, 6); NH(rNew, 6, 0);
-        DrawHeaderIcon(g, rMin, 7); NH(rMin, 7, 0);
-        DrawHeaderIcon(g, rClose, 8); NH(rClose, 8, 0);
-
-        // date + title
+        // date, small in the top-right corner (title and header buttons are gone; everything is in the right-click menu)
         string ds = DateTime.Now.ToString("ddd, MMM d");
         float dateW;
         using (StringFormat mf = Fmt(StringAlignment.Near)) dateW = g.MeasureString(ds, fDate, 10000, mf).Width;
-        Rectangle dr = new Rectangle((int)(Wn - 14 * sc - dateW - 2), PTop + (int)(40 * sc), (int)dateW + 4, (int)(22 * sc));
-        using (SolidBrush db = new SolidBrush(Color.FromArgb(240, INK))) using (StringFormat df = Fmt(StringAlignment.Far)) g.DrawString(ds, fDate, db, dr, df);
-
-        titleR = new Rectangle(textX - (int)(2 * sc), PTop + (int)(24 * sc), Math.Max((int)(40 * sc), dr.X - textX - (int)(6 * sc)), (int)(36 * sc));
-        NH(titleR, 4, 0);
-        float tw = 0;
-        using (StringFormat tf = Fmt(StringAlignment.Near)) {
-            tw = Math.Min(g.MeasureString(D.Title, fTitle, 10000, tf).Width, titleR.Width);
-            if (edKind != 3) using (SolidBrush ib = new SolidBrush(INK)) g.DrawString(D.Title, fTitle, ib, titleR, tf);
-        }
-        float uy = titleR.Bottom - 3 * sc, ux = titleR.X + 2 * sc;
-        using (Pen up = new Pen(INK, 2.2f * sc)) {
-            up.StartCap = LineCap.Round; up.EndCap = LineCap.Round;
-            g.DrawBezier(up, ux, uy, ux + tw * 0.3f, uy + 3 * sc, ux + tw * 0.6f, uy - 2.5f * sc, ux + tw, uy + 0.5f * sc);
-        }
+        Rectangle dr = new Rectangle((int)(Wn - 14 * sc - dateW - 2), PTop + (int)(8 * sc), (int)dateW + 4, (int)(22 * sc));
+        using (SolidBrush db = new SolidBrush(Color.FromArgb(200, INK))) using (StringFormat df = Fmt(StringAlignment.Far)) g.DrawString(ds, fDate, db, dr, df);
+        titleR = Rectangle.Empty;
 
         // body: tasks (checkbox in the left column) and plain text, both word-wrapped; one text line per ruled line
         LayoutBody();
@@ -1399,6 +1380,7 @@ class Preview : Form {
         StartPosition = FormStartPosition.Manual;
         BackColor = BG;
         TopMost = true;
+        AllowDrop = true;
         font = new Font("Segoe UI", 9f);
         icons = new Font("Segoe MDL2 Assets", 8f);
         pad = (int)(8 * sc); gap = (int)(6 * sc); cw = (int)(224 * sc);
@@ -1530,6 +1512,28 @@ class Preview : Form {
         base.OnMouseMove(e);
     }
     protected override void OnMouseLeave(EventArgs e) { hoverCard = -1; hoverClose = false; Invalidate(); base.OnMouseLeave(e); }
+
+    // dragging files over a thumbnail: highlight it, and after a short hold switch to that window so the files can be dropped in it
+    int dragCard = -1, dragSince;
+    public bool DragActive;
+    void DragAt(DragEventArgs e) {
+        DragActive = true;
+        e.Effect = DragDropEffects.None;   // the drop itself goes into the window once it is in front
+        Point c = PointToClient(new Point(e.X, e.Y));
+        int hc = -1;
+        for (int i = 0; i < cards.Count && i < items.Count; i++) if (cards[i].Contains(c)) { hc = i; break; }
+        if (hc != hoverCard) { hoverCard = hc; hoverClose = false; Invalidate(); }
+        if (hc != dragCard) { dragCard = hc; dragSince = Environment.TickCount; }
+        else if (hc >= 0 && Environment.TickCount - dragSince >= 500) {
+            Win w = items[hc];
+            dragCard = -1; DragActive = false;
+            onPick(w);
+        }
+    }
+    protected override void OnDragEnter(DragEventArgs e) { DragAt(e); base.OnDragEnter(e); }
+    protected override void OnDragOver(DragEventArgs e) { DragAt(e); base.OnDragOver(e); }
+    protected override void OnDragLeave(EventArgs e) { DragActive = false; dragCard = -1; hoverCard = -1; Invalidate(); base.OnDragLeave(e); }
+
     protected override void OnMouseUp(MouseEventArgs e) {
         for (int i = 0; i < cards.Count && i < items.Count; i++) {
             if (!cards[i].Contains(e.Location)) continue;
@@ -2150,9 +2154,22 @@ class Bar : Form {
         else if (b == MouseButtons.Right) Key2(0x5B, 0x58); // Win+X power-user menu
     }
 
-    static void Activate(Win w) {
-        if (Native.IsIconic(w.H)) Native.ShowWindow(w.H, 9);   // restore
-        Native.SetForegroundWindow(w.H);
+    // Windows refuses SetForegroundWindow from a program that isn't in front (our bar never takes focus),
+    // so briefly join the input of the window that is in front, then bring ours forward.
+    static void Activate(Win w) { Activate(w.H); }
+    static void Activate(IntPtr h) {
+        if (Native.IsIconic(h)) Native.ShowWindow(h, 9);   // restore
+        IntPtr fg = Native.GetForegroundWindow();
+        if (fg == h) return;
+        uint pid;
+        uint fgThread = fg != IntPtr.Zero ? Native.GetWindowThreadProcessId(fg, out pid) : 0;
+        uint me = Native.GetCurrentThreadId();
+        bool attached = fgThread != 0 && fgThread != me && Native.AttachThreadInput(me, fgThread, true);
+        try {
+            Native.BringWindowToTop(h);
+            Native.SetForegroundWindow(h);
+        } finally { if (attached) Native.AttachThreadInput(me, fgThread, false); }
+        if (Native.GetForegroundWindow() != h) Native.SwitchToThisWindow(h, true);   // last resort
     }
     void ToggleWin(Win w) {
         if (Native.GetForegroundWindow() == w.H && !Native.IsIconic(w.H)) { Snap(w); Native.ShowWindow(w.H, 6); }   // minimize
@@ -2241,10 +2258,10 @@ class Bar : Form {
     void NoteClick(MouseButtons b) {
         if (b == MouseButtons.Left) {
             if (notes.Count == 0) { NewNote(); return; }
-            bool allVisible = true, focused = false;
-            foreach (StickyNote n in notes) { if (!n.Visible) allVisible = false; if (n.IsForeground) focused = true; }
-            if (allVisible && focused) { foreach (StickyNote n2 in notes) n2.HideNote(); }   // click again to tuck them away
-            else { foreach (StickyNote n3 in notes) n3.ShowNote(); }
+            bool anyVisible = false;
+            foreach (StickyNote n in notes) if (n.Visible) anyVisible = true;
+            if (anyVisible) { foreach (StickyNote n2 in notes) n2.HideNote(); }   // one click hides them...
+            else { foreach (StickyNote n3 in notes) n3.ShowNote(); }              // ...the next brings them back
         }
         else if (b == MouseButtons.Right) {
             List<PopItem> m = new List<PopItem>();
@@ -2457,10 +2474,10 @@ class Bar : Form {
         e.Effect = eff;
         if (hl != hoverR) { hoverR = hl; Invalidate(); }
         if (hoverKey != dragHoverKey) { dragHoverKey = hoverKey; dragHoverSince = Environment.TickCount; dragHoverDone = false; }
-        else if (hoverKey != null && !dragHoverDone && Environment.TickCount - dragHoverSince >= 700) {
-            dragHoverDone = true;   // held over a window for a moment: bring it forward so the files can be dropped into it
+        else if (hoverKey != null && !dragHoverDone && Environment.TickCount - dragHoverSince >= 900) {
             List<Win> ws = WinsFor(hoverKey);
-            if (ws.Count > 0) Activate(ws[0]);
+            if (ws.Count == 1) { dragHoverDone = true; HidePreview(); Activate(ws[0]); }   // one window: switch to it
+            // several windows: the preview is open; hold over the thumbnail you want
         }
     }
     protected override void OnDragEnter(DragEventArgs e) { DragStateFrom(e); DragCheck(e); base.OnDragEnter(e); }
@@ -2565,7 +2582,7 @@ class Bar : Form {
         List<Seg> segs = new List<Seg>();
         int gap = (int)(12 * scale), tight = (int)(8 * scale);
         Seg sBin = new Seg(); sBin.T = "\uE74D"; sBin.F = icons; sBin.C = binItems > 0 ? FG : DIM; sBin.Pad = 0; sBin.A = BinClick; segs.Add(sBin);
-        Seg s0 = new Seg(); s0.T = trayShown ? "\uE70E" : "\uE70D"; s0.F = icons; s0.C = FG; s0.Pad = tight; s0.A = TrayClick; segs.Add(s0);
+        Seg s0 = new Seg(); s0.T = trayShown ? "\uE70D" : "\uE70E"; s0.F = icons; s0.C = FG; s0.Pad = tight; s0.A = TrayClick; segs.Add(s0);
         Seg s1 = new Seg(); s1.T = "CPU " + (int)cpuVal + "%"; s1.F = font; s1.C = DIM; s1.Pad = tight; s1.A = OpenTaskMgr; if (showStats) segs.Add(s1);
         Seg s2 = new Seg(); s2.T = "RAM " + ramVal + "%"; s2.F = font; s2.C = DIM; s2.Pad = gap; s2.A = OpenTaskMgr; if (showStats) segs.Add(s2);
         Seg sNote = new Seg(); sNote.FixedW = (int)(14 * scale) + 2; sNote.Draw = DrawNoteIcon; sNote.C = FG; sNote.Pad = gap; sNote.A = NoteClick; segs.Add(sNote);
