@@ -407,6 +407,14 @@ static class Native {
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool LockWorkStation();
     [DllImport("user32.dll")] public static extern bool ReleaseCapture();
+    public delegate IntPtr LLProc(int code, IntPtr w, IntPtr l);
+    [DllImport("user32.dll")] public static extern IntPtr SetWindowsHookEx(int id, LLProc proc, IntPtr mod, uint thread);
+    [DllImport("user32.dll")] public static extern bool UnhookWindowsHookEx(IntPtr hook);
+    [DllImport("user32.dll")] public static extern IntPtr CallNextHookEx(IntPtr hook, int code, IntPtr w, IntPtr l);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr GetModuleHandle(string name);
+    [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vk);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "SendMessageW")] public static extern IntPtr SendMessageStr(IntPtr h, int msg, IntPtr w, string l);
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)] public static extern int SHCreateItemFromParsingName(string name, IntPtr ctx, ref Guid iid, [MarshalAs(UnmanagedType.IUnknown)] out object item);
     [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
     [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
     [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
@@ -1353,6 +1361,374 @@ class StickyNote : Form {
     }
 }
 
+// ====================== Quick search (Win+Space) ======================
+class SearchItem {
+    public string Name, Path, Keywords = "";
+    public bool Setting;
+    public Bitmap Icon;
+}
+
+[ComImport, Guid("BCC18B79-BA16-442F-80C4-8A59C30C463B"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IShellItemImageFactory { [PreserveSig] int GetImage(PSIZE size, int flags, out IntPtr hbm); }
+
+static class AppIndex {
+    // Everything in Start's "All apps" (desktop and Store apps) comes from the shell's Apps folder.
+    public static List<SearchItem> LoadApps(int iconPx) {
+        List<SearchItem> list = new List<SearchItem>();
+        Dictionary<string, bool> seen = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        object sh = null, folder = null, items = null;
+        try {
+            Type t = Type.GetTypeFromProgID("Shell.Application");
+            sh = Activator.CreateInstance(t);
+            folder = t.InvokeMember("NameSpace", BindingFlags.InvokeMethod, null, sh, new object[] { "shell:AppsFolder" });
+            items = folder.GetType().InvokeMember("Items", BindingFlags.InvokeMethod, null, folder, null);
+            int n = (int)items.GetType().InvokeMember("Count", BindingFlags.GetProperty, null, items, null);
+            for (int i = 0; i < n; i++) {
+                object it = null;
+                try {
+                    it = items.GetType().InvokeMember("Item", BindingFlags.InvokeMethod, null, items, new object[] { i });
+                    if (it == null) continue;
+                    string name = it.GetType().InvokeMember("Name", BindingFlags.GetProperty, null, it, null) as string;
+                    string path = it.GetType().InvokeMember("Path", BindingFlags.GetProperty, null, it, null) as string;
+                    if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(path) || !IsApp(name, path) || seen.ContainsKey(name)) continue;
+                    seen[name] = true;
+                    SearchItem s = new SearchItem(); s.Name = name; s.Path = path;
+                    s.Icon = ShellIcon("shell:AppsFolder\\" + path, iconPx);
+                    list.Add(s);
+                } catch { }
+                finally { if (it != null) try { Marshal.ReleaseComObject(it); } catch { } }
+            }
+        } catch (Exception ex) { Log.Write("app index: " + ex.Message); }
+        finally {
+            if (items != null) try { Marshal.ReleaseComObject(items); } catch { }
+            if (folder != null) try { Marshal.ReleaseComObject(folder); } catch { }
+            if (sh != null) try { Marshal.ReleaseComObject(sh); } catch { }
+        }
+        return list;
+    }
+    // only real apps: no uninstallers, read-me files, help files or web links
+    static bool IsApp(string name, string path) {
+        string n = name.ToLowerInvariant(), p = path.ToLowerInvariant();
+        if (n.Contains("uninstall") || n.Contains("readme") || n.Contains("read me") || n.Contains("release notes") || n.Contains("documentation")) return false;
+        if (p.StartsWith("http:") || p.StartsWith("https:") || p.StartsWith("mailto:")) return false;
+        string[] bad = { ".url", ".txt", ".chm", ".pdf", ".htm", ".html", ".rtf", ".hlp", ".ini", ".log", ".md" };
+        foreach (string b in bad) if (p.EndsWith(b)) return false;
+        return true;
+    }
+    // icon with real transparency (Image.FromHbitmap alone drops the alpha channel)
+    public static Bitmap ShellIcon(string parsingName, int px) {
+        object o = null; IntPtr hbm = IntPtr.Zero;
+        try {
+            Guid iid = new Guid("BCC18B79-BA16-442F-80C4-8A59C30C463B");
+            if (Native.SHCreateItemFromParsingName(parsingName, IntPtr.Zero, ref iid, out o) != 0 || o == null) return null;
+            PSIZE sz = new PSIZE(); sz.W = px; sz.H = px;
+            if (((IShellItemImageFactory)o).GetImage(sz, 0x4, out hbm) != 0 || hbm == IntPtr.Zero) return null;   // SIIGBF_ICONONLY
+            using (Bitmap raw = Image.FromHbitmap(hbm)) {
+                Rectangle r = new Rectangle(0, 0, raw.Width, raw.Height);
+                BitmapData bd = raw.LockBits(r, ImageLockMode.ReadOnly, raw.PixelFormat);
+                try {
+                    using (Bitmap pre = new Bitmap(raw.Width, raw.Height, bd.Stride, PixelFormat.Format32bppPArgb, bd.Scan0)) {
+                        Bitmap outp = new Bitmap(raw.Width, raw.Height, PixelFormat.Format32bppArgb);
+                        using (Graphics g = Graphics.FromImage(outp)) g.DrawImage(pre, 0, 0, raw.Width, raw.Height);
+                        return outp;
+                    }
+                } finally { raw.UnlockBits(bd); }
+            }
+        } catch { return null; }
+        finally {
+            if (hbm != IntPtr.Zero) Native.DeleteObject(hbm);
+            if (o != null) try { Marshal.ReleaseComObject(o); } catch { }
+        }
+    }
+
+    public static List<SearchItem> Settings() {
+        string[,] s = {
+            { "Display", "display", "screen resolution scale brightness monitor" },
+            { "Night light", "nightlight", "blue light warm" },
+            { "Sound", "sound", "audio volume speaker microphone output input" },
+            { "Notifications", "notifications", "alerts do not disturb" },
+            { "Focus", "focus", "focus assist concentrate" },
+            { "Power & battery", "powersleep", "battery sleep power mode energy saver" },
+            { "Storage", "storagesense", "disk space cleanup drive" },
+            { "Multitasking", "multitasking", "snap windows virtual desktops" },
+            { "Clipboard", "clipboard", "copy paste history" },
+            { "Remote Desktop", "remotedesktop", "rdp" },
+            { "About", "about", "pc name specs system info device" },
+            { "Bluetooth & devices", "bluetooth", "devices pair headphones" },
+            { "Printers & scanners", "printers", "printer scanner print" },
+            { "Mouse", "mousetouchpad", "pointer cursor speed" },
+            { "Touchpad", "devices-touchpad", "gestures trackpad" },
+            { "Typing", "typing", "keyboard autocorrect" },
+            { "Camera", "camera", "webcam" },
+            { "AutoPlay", "autoplay", "usb" },
+            { "Wi-Fi", "network-wifi", "wireless wlan internet" },
+            { "Network & internet", "network", "ethernet internet connection" },
+            { "VPN", "network-vpn", "" },
+            { "Mobile hotspot", "network-mobilehotspot", "hotspot share" },
+            { "Airplane mode", "network-airplanemode", "flight" },
+            { "Proxy", "network-proxy", "" },
+            { "Personalization", "personalization", "customize look" },
+            { "Background", "personalization-background", "wallpaper desktop picture" },
+            { "Colors", "colors", "accent dark mode light mode theme" },
+            { "Themes", "themes", "" },
+            { "Lock screen", "lockscreen", "" },
+            { "Start", "personalization-start", "start menu" },
+            { "Taskbar", "taskbar", "" },
+            { "Fonts", "fonts", "typeface" },
+            { "Installed apps", "appsfeatures", "uninstall programs apps features" },
+            { "Default apps", "defaultapps", "open with browser" },
+            { "Startup apps", "startupapps", "startup boot" },
+            { "Optional features", "optionalfeatures", "" },
+            { "Your info", "yourinfo", "account profile" },
+            { "Sign-in options", "signinoptions", "password pin windows hello fingerprint face" },
+            { "Email & accounts", "emailandaccounts", "mail" },
+            { "Date & time", "dateandtime", "clock time zone" },
+            { "Language & region", "regionlanguage", "keyboard layout input" },
+            { "Gaming", "gaming", "game mode xbox" },
+            { "Accessibility", "easeofaccess", "ease of access" },
+            { "Text size", "easeofaccess-display", "bigger text" },
+            { "Narrator", "easeofaccess-narrator", "screen reader" },
+            { "Privacy & security", "privacy", "permissions" },
+            { "Windows Security", "windowsdefender", "antivirus defender virus firewall" },
+            { "Location", "privacy-location", "gps" },
+            { "Windows Update", "windowsupdate", "updates upgrade patch" },
+            { "Recovery", "recovery", "reset restore" },
+            { "Activation", "activation", "product key license" },
+            { "Troubleshoot", "troubleshoot", "fix problems" },
+            { "Backup", "backup", "onedrive" },
+            { "Developer settings", "developers", "developer mode" },
+        };
+        List<SearchItem> list = new List<SearchItem>();
+        for (int i = 0; i < s.GetLength(0); i++) {
+            SearchItem it = new SearchItem(); it.Name = s[i, 0]; it.Path = "ms-settings:" + s[i, 1]; it.Keywords = s[i, 2]; it.Setting = true;
+            list.Add(it);
+        }
+        return list;
+    }
+
+    // 0 = no match. Name start beats word start beats initials beats anywhere.
+    public static int Score(SearchItem it, string q) {
+        if (q.Length == 0) return 0;
+        string n = it.Name.ToLowerInvariant();
+        int sc = 0;
+        if (n.StartsWith(q)) sc = 1000 - Math.Min(200, n.Length);
+        else {
+            string[] words = n.Split(new char[] { ' ', '-', '_', '.', '&', '(', ')' }, StringSplitOptions.RemoveEmptyEntries);
+            StringBuilder ini = new StringBuilder();
+            foreach (string w in words) { if (w.StartsWith(q)) sc = Math.Max(sc, 800 - Math.Min(200, n.Length)); ini.Append(w[0]); }
+            if (sc == 0 && q.Length >= 2 && ini.ToString().StartsWith(q)) sc = 600;
+            if (sc == 0 && q.Length >= 2 && n.Contains(q)) sc = 400;
+            if (sc == 0 && it.Keywords.Length > 0) {
+                foreach (string k in it.Keywords.Split(' ')) if (k.StartsWith(q)) { sc = 300; break; }
+            }
+        }
+        if (sc > 0 && !it.Setting) sc += 50;   // apps before settings when equally good
+        return sc;
+    }
+}
+
+class Launcher : Form {
+    static readonly Color BG = Color.FromArgb(32, 32, 32);
+    static readonly Color BOX = Color.FromArgb(44, 44, 44);
+    static readonly Color SEL = Color.FromArgb(58, 58, 58);
+    static readonly Color BORDER = Color.FromArgb(70, 70, 70);
+    static readonly Color FG = Color.FromArgb(240, 240, 240);
+    static readonly Color DIM = Color.FromArgb(150, 150, 150);
+    static readonly Color ACCENT = Color.FromArgb(96, 165, 250);
+
+    float sc; int Wd, pad, boxH, rowH, maxRows, iconPx;
+    TextBox tb;
+    Font fBox, fName, fKind, fIcon;
+    List<SearchItem> apps = new List<SearchItem>(), settings;
+    List<SearchItem> results = new List<SearchItem>();
+    int sel, hover = -1;
+    bool deleting, filling, loading;
+    DateTime loadedAt = DateTime.MinValue;
+
+    public Launcher(float scale) {
+        sc = scale;
+        Wd = (int)(600 * sc); pad = (int)(10 * sc); boxH = (int)(46 * sc); rowH = (int)(42 * sc); maxRows = 8; iconPx = (int)(28 * sc);
+        DoubleBuffered = true;
+        FormBorderStyle = FormBorderStyle.None;
+        ShowInTaskbar = false;
+        StartPosition = FormStartPosition.Manual;
+        TopMost = true;
+        KeyPreview = true;
+        BackColor = BG;
+        fBox = new Font("Segoe UI", 13f);
+        fName = new Font("Segoe UI", 10.5f);
+        fKind = new Font("Segoe UI", 8.5f);
+        fIcon = new Font("Segoe MDL2 Assets", 13f);
+        settings = AppIndex.Settings();
+
+        tb = new TextBox();
+        tb.BorderStyle = BorderStyle.None;
+        tb.BackColor = BOX; tb.ForeColor = FG; tb.Font = fBox;
+        tb.Location = new Point(pad + (int)(44 * sc), pad + (boxH - tb.PreferredHeight) / 2);
+        tb.Width = Wd - 2 * pad - (int)(56 * sc);
+        tb.HandleCreated += delegate { Native.SendMessageStr(tb.Handle, 0x1501, (IntPtr)1, "Search apps and settings"); };   // EM_SETCUEBANNER
+        tb.KeyDown += TbKey;
+        tb.TextChanged += delegate { OnQuery(); };
+        Controls.Add(tb);
+        ResizeTo(0);
+    }
+
+    protected override CreateParams CreateParams {
+        get { CreateParams cp = base.CreateParams; cp.ExStyle |= 0x80; cp.ClassStyle |= 0x20000; return cp; }   // tool window, drop shadow
+    }
+    protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); Ui.Corners(Handle); }
+    protected override void OnDeactivate(EventArgs e) { base.OnDeactivate(e); if (Visible) Hide(); }
+
+    // ---------- index (built in the background; the old list is used meanwhile) ----------
+    public void Refresh(bool force) {
+        if (loading || (!force && (DateTime.UtcNow - loadedAt).TotalSeconds < 120)) return;
+        loading = true;
+        Thread th = new Thread(delegate() {
+            List<SearchItem> list = AppIndex.LoadApps(iconPx);
+            try {
+                BeginInvoke(new Action(delegate {
+                    foreach (SearchItem o in apps) if (o.Icon != null) o.Icon.Dispose();
+                    apps = list; loadedAt = DateTime.UtcNow; loading = false;
+                    if (Visible) OnQuery();
+                }));
+            } catch { loading = false; }
+        });
+        th.SetApartmentState(ApartmentState.STA);
+        th.IsBackground = true;
+        th.Start();
+    }
+
+    public void Toggle() {
+        if (Visible) { Hide(); return; }
+        Rectangle wa = Screen.PrimaryScreen.WorkingArea;
+        Location = new Point(wa.Left + (wa.Width - Wd) / 2, wa.Top + (int)(wa.Height * 0.22));
+        filling = true; tb.Text = ""; filling = false;
+        results.Clear(); sel = 0; hover = -1;
+        ResizeTo(0);
+        Show();
+        Bar.Activate(Handle);
+        tb.Focus();
+        Refresh(false);
+    }
+
+    void ResizeTo(int rows) {
+        int h = pad + boxH + pad + (rows > 0 ? rows * rowH + pad : 0);
+        Size = new Size(Wd, h);
+        Invalidate();
+    }
+
+    string Query() {
+        string t = tb.Text;
+        if (tb.SelectionLength > 0 && tb.SelectionStart + tb.SelectionLength == t.Length) t = t.Substring(0, tb.SelectionStart);   // ignore the auto-filled part
+        return t.Trim().ToLowerInvariant();
+    }
+
+    void OnQuery() {
+        if (filling) return;
+        string q = Query();
+        List<KeyValuePair<int, SearchItem>> hits = new List<KeyValuePair<int, SearchItem>>();
+        if (q.Length > 0) {
+            foreach (SearchItem it in apps) { int s = AppIndex.Score(it, q); if (s > 0) hits.Add(new KeyValuePair<int, SearchItem>(s, it)); }
+            foreach (SearchItem it in settings) { int s = AppIndex.Score(it, q); if (s > 0) hits.Add(new KeyValuePair<int, SearchItem>(s, it)); }
+            hits.Sort(delegate(KeyValuePair<int, SearchItem> a, KeyValuePair<int, SearchItem> b) {
+                int c = b.Key.CompareTo(a.Key);
+                return c != 0 ? c : string.Compare(a.Value.Name, b.Value.Name, StringComparison.OrdinalIgnoreCase);
+            });
+        }
+        results.Clear();
+        for (int i = 0; i < hits.Count && i < maxRows; i++) results.Add(hits[i].Value);
+        sel = 0; hover = -1;
+        ResizeTo(results.Count);
+
+        // auto-fill: complete the typed text with the best match's name (selected, so typing on replaces it)
+        if (!deleting && results.Count > 0 && tb.SelectionStart == tb.Text.Length) {
+            string typed = tb.Text, name = results[0].Name;
+            if (typed.Length > 0 && name.Length > typed.Length && name.StartsWith(typed, StringComparison.OrdinalIgnoreCase)) {
+                filling = true;
+                tb.Text = typed + name.Substring(typed.Length);
+                tb.Select(typed.Length, name.Length - typed.Length);
+                filling = false;
+            }
+        }
+        deleting = false;
+    }
+
+    void TbKey(object sender, KeyEventArgs e) {
+        if (e.KeyCode == Keys.Back || e.KeyCode == Keys.Delete) {
+            deleting = true;
+            if (e.KeyCode == Keys.Back && tb.SelectionLength > 0 && tb.SelectionStart + tb.SelectionLength == tb.TextLength) {
+                // first Backspace just removes the auto-filled part
+                e.SuppressKeyPress = true;
+                filling = true; tb.Text = tb.Text.Substring(0, tb.SelectionStart); tb.SelectionStart = tb.TextLength; filling = false;
+                deleting = true; OnQuery();
+            }
+        }
+        else if (e.KeyCode == Keys.Escape) { e.SuppressKeyPress = true; Hide(); }
+        else if (e.KeyCode == Keys.Down) { e.SuppressKeyPress = true; if (results.Count > 0) { sel = (sel + 1) % results.Count; Invalidate(); } }
+        else if (e.KeyCode == Keys.Up) { e.SuppressKeyPress = true; if (results.Count > 0) { sel = (sel - 1 + results.Count) % results.Count; Invalidate(); } }
+        else if (e.KeyCode == Keys.Tab) { e.SuppressKeyPress = true; tb.SelectionStart = tb.TextLength; tb.SelectionLength = 0; }   // accept auto-fill
+        else if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; if (results.Count > 0) Open(results[Math.Max(0, Math.Min(sel, results.Count - 1))]); }
+    }
+    protected override bool ProcessDialogKey(Keys k) {
+        if (k == Keys.Tab) { tb.SelectionStart = tb.TextLength; tb.SelectionLength = 0; return true; }
+        return base.ProcessDialogKey(k);
+    }
+
+    void Open(SearchItem it) {
+        Hide();
+        try {
+            ProcessStartInfo psi = it.Setting ? new ProcessStartInfo(it.Path) : new ProcessStartInfo("explorer.exe", "shell:AppsFolder\\" + it.Path);
+            psi.UseShellExecute = true;
+            Process.Start(psi);
+        } catch (Exception ex) { Log.Write("launch " + it.Name + ": " + ex.Message); }
+    }
+
+    Rectangle RowRect(int i) { return new Rectangle(pad, pad + boxH + pad + i * rowH, Wd - 2 * pad, rowH); }
+
+    protected override void OnPaint(PaintEventArgs e) {
+        Graphics g = e.Graphics;
+        g.Clear(BG);
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        using (Pen bp = new Pen(BORDER)) g.DrawRectangle(bp, 0, 0, ClientSize.Width - 1, ClientSize.Height - 1);
+        Rectangle box = new Rectangle(pad, pad, Wd - 2 * pad, boxH);
+        using (GraphicsPath p = Ui.Round(box, (int)(8 * sc))) {
+            using (SolidBrush b = new SolidBrush(BOX)) g.FillPath(b, p);
+            using (Pen ap = new Pen(Color.FromArgb(120, ACCENT), 1f)) g.DrawPath(ap, p);
+        }
+        TextRenderer.DrawText(g, "\uE721", fIcon, new Rectangle(box.X + (int)(10 * sc), box.Y, (int)(28 * sc), box.Height), DIM, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+
+        TextFormatFlags tf = TextFormatFlags.NoPadding | TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix;
+        for (int i = 0; i < results.Count; i++) {
+            Rectangle r = RowRect(i);
+            SearchItem it = results[i];
+            if (i == sel || i == hover) {
+                using (GraphicsPath p = Ui.Round(r, (int)(6 * sc))) using (SolidBrush b = new SolidBrush(i == sel ? SEL : BOX)) g.FillPath(b, p);
+                if (i == sel) using (SolidBrush ab = new SolidBrush(ACCENT)) g.FillRectangle(ab, r.X, r.Y + r.Height / 4, Math.Max(2, (int)(3 * sc)), r.Height / 2);
+            }
+            Rectangle ir = new Rectangle(r.X + (int)(12 * sc), r.Y + (r.Height - iconPx) / 2, iconPx, iconPx);
+            if (it.Setting) TextRenderer.DrawText(g, "\uE713", fIcon, ir, FG, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            else if (it.Icon != null) g.DrawImage(it.Icon, ir);
+            int tx = ir.Right + (int)(12 * sc);
+            string kind = it.Setting ? "Settings" : "App";
+            Size ks = TextRenderer.MeasureText(kind, fKind);
+            TextRenderer.DrawText(g, it.Name, fName, new Rectangle(tx, r.Y, r.Right - tx - ks.Width - (int)(20 * sc), r.Height), FG, tf);
+            TextRenderer.DrawText(g, kind, fKind, new Rectangle(r.Right - ks.Width - (int)(12 * sc), r.Y, ks.Width + 4, r.Height), DIM, tf);
+        }
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e) {
+        int h = -1;
+        for (int i = 0; i < results.Count; i++) if (RowRect(i).Contains(e.Location)) { h = i; break; }
+        if (h != hover) { hover = h; Cursor = h >= 0 ? Cursors.Hand : Cursors.Default; Invalidate(); }
+        base.OnMouseMove(e);
+    }
+    protected override void OnMouseLeave(EventArgs e) { if (hover != -1) { hover = -1; Invalidate(); } base.OnMouseLeave(e); }
+    protected override void OnMouseUp(MouseEventArgs e) {
+        if (e.Button == MouseButtons.Left) for (int i = 0; i < results.Count; i++) if (RowRect(i).Contains(e.Location)) { Open(results[i]); break; }
+        base.OnMouseUp(e);
+    }
+}
+
 // Hover preview popup: live DWM thumbnails of one or more windows, shown above the bar.
 class Preview : Form {
     static readonly Color BG = Color.FromArgb(32, 32, 32);
@@ -1588,6 +1964,10 @@ class Bar : Form {
     // taskbar look + drag and drop
     int style;                 // 0 solid, 1 translucent, 2 transparent
     bool showStats = true;     // CPU / RAM
+    bool searchKey = true;     // Win+Space opens the search box
+    Launcher launcher;
+    static Native.LLProc hookProc;   // kept in a field so it is never garbage-collected
+    IntPtr kbHook; bool swallowSpaceUp;
     string settingsFile;
     string[] dragFiles; bool dragPinnable; string dragHoverKey; int dragHoverSince; bool dragHoverDone;
     List<StickyNote> notes = new List<StickyNote>();
@@ -1648,6 +2028,10 @@ class Bar : Form {
         base.OnShown(e);
         RegisterBar();
         ApplyStyle();
+        launcher = new Launcher(scale);
+        IntPtr lh = launcher.Handle;   // create it now so the app list can load in the background
+        launcher.Refresh(true);
+        SetSearchKey(searchKey);
         SetPos(); Tick(); LoadNotes(); timer.Start(); hideTimer.Start(); prevTimer.Start(); trimTimer.Start();
     }
 
@@ -1659,6 +2043,7 @@ class Bar : Form {
 
     protected override void OnFormClosing(FormClosingEventArgs e) {
         timer.Stop(); hideTimer.Stop(); prevTimer.Stop(); trimTimer.Stop();
+        SetSearchKey(false);
         SaveNotes();
         foreach (StickyNote sn in notes.ToArray()) { try { sn.Close(); } catch { } }
         preview.Dismiss(); preview.Close(); pop.Close();
@@ -2157,7 +2542,7 @@ class Bar : Form {
     // Windows refuses SetForegroundWindow from a program that isn't in front (our bar never takes focus),
     // so briefly join the input of the window that is in front, then bring ours forward.
     static void Activate(Win w) { Activate(w.H); }
-    static void Activate(IntPtr h) {
+    public static void Activate(IntPtr h) {
         if (Native.IsIconic(h)) Native.ShowWindow(h, 9);   // restore
         IntPtr fg = Native.GetForegroundWindow();
         if (fg == h) return;
@@ -2301,13 +2686,14 @@ class Bar : Form {
                 string k = line.Substring(0, i).Trim(), v = line.Substring(i + 1).Trim();
                 if (k == "style") { int.TryParse(v, out style); if (style < 0 || style > 2) style = 0; }
                 else if (k == "stats") showStats = v != "0";
+                else if (k == "search") searchKey = v != "0";
             }
         } catch { }
     }
     void SaveSettings() {
         try {
             Directory.CreateDirectory(Path.GetDirectoryName(settingsFile));
-            File.WriteAllLines(settingsFile, new string[] { "style=" + style, "stats=" + (showStats ? 1 : 0) });
+            File.WriteAllLines(settingsFile, new string[] { "style=" + style, "stats=" + (showStats ? 1 : 0), "search=" + (searchKey ? 1 : 0) });
         } catch { }
     }
     // Uses Windows' (undocumented) accent policy: blur behind the bar, or a fully clear bar.
@@ -2347,6 +2733,37 @@ class Bar : Form {
         } catch (Exception ex) { Log.Write("new item: " + ex); }
     }
 
+    // ---------- Win+Space search ----------
+    // A low-level keyboard hook catches Win+Space (Windows normally uses it to switch keyboard language).
+    void SetSearchKey(bool on) {
+        if (on && kbHook == IntPtr.Zero) {
+            if (hookProc == null) hookProc = KeyHook;
+            kbHook = Native.SetWindowsHookEx(13, hookProc, Native.GetModuleHandle(null), 0);   // WH_KEYBOARD_LL
+            if (kbHook == IntPtr.Zero) Log.Write("search: keyboard hook failed");
+        } else if (!on && kbHook != IntPtr.Zero) {
+            Native.UnhookWindowsHookEx(kbHook); kbHook = IntPtr.Zero;
+        }
+    }
+    IntPtr KeyHook(int code, IntPtr w, IntPtr l) {
+        if (code >= 0) {
+            int vk = Marshal.ReadInt32(l), flags = Marshal.ReadInt32(l, 8), msg = w.ToInt32();
+            if (vk == 0x20 && (flags & 0x10) == 0) {   // Space, typed by a person (not injected)
+                bool win = (Native.GetAsyncKeyState(0x5B) & 0x8000) != 0 || (Native.GetAsyncKeyState(0x5C) & 0x8000) != 0;
+                if ((msg == 0x100 || msg == 0x104) && win) {
+                    if (!swallowSpaceUp) { swallowSpaceUp = true; BeginInvoke(new Action(OpenSearch)); }
+                    return (IntPtr)1;   // Windows never sees it
+                }
+                if ((msg == 0x101 || msg == 0x105) && swallowSpaceUp) { swallowSpaceUp = false; return (IntPtr)1; }
+            }
+        }
+        return Native.CallNextHookEx(kbHook, code, w, l);
+    }
+    void OpenSearch() {
+        TrayChevron.Keys(0xE8);   // a harmless key, so letting go of Win doesn't open Start
+        HidePreview(); ClosePop();
+        launcher.Toggle();
+    }
+
     void ShowBarMenu() {
         List<PopItem> m = new List<PopItem>();
         m.Add(MI(style == 0 ? "\uE73E" : null, "Solid taskbar", delegate { style = 0; SaveSettings(); ApplyStyle(); }));
@@ -2359,6 +2776,7 @@ class Bar : Form {
         m.Add(MI(null, "Task Manager", delegate { OpenTaskMgr(MouseButtons.Left); }));
         m.Add(MI(null, "Show desktop", delegate { Key2(0x5B, 0x44); }));
         m.Add(MI(showStats ? "\uE73E" : null, "Show CPU and RAM", delegate { showStats = !showStats; SaveSettings(); Invalidate(); }));
+        m.Add(MI(searchKey ? "\uE73E" : null, "Win+Space search", delegate { searchKey = !searchKey; SetSearchKey(searchKey); SaveSettings(); }));
         m.Add(SepItem());
         m.Add(MI("\uE711", "Exit Fable Thin Bar", delegate { Close(); }));
         OpenPop(m);
