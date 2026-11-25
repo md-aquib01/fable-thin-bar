@@ -370,6 +370,10 @@ using System.Windows.Forms;
 [StructLayout(LayoutKind.Sequential)] struct APPBARDATA { public int cbSize; public IntPtr hWnd; public uint uCallbackMessage; public uint uEdge; public RECT rc; public IntPtr lParam; }
 [StructLayout(LayoutKind.Sequential)] struct PSIZE { public int W, H; }
 [StructLayout(LayoutKind.Sequential)] struct PT { public int X, Y; }
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct PENTRY {
+    public uint dwSize, cntUsage, th32ProcessID; public IntPtr th32DefaultHeapID; public uint th32ModuleID, cntThreads, th32ParentProcessID;
+    public int pcPriClassBase; public uint dwFlags; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string szExeFile;
+}
 [StructLayout(LayoutKind.Explicit, Size = 40)] struct KINPUT {
     [FieldOffset(0)] public int Type; [FieldOffset(8)] public ushort Vk; [FieldOffset(10)] public ushort Scan;
     [FieldOffset(12)] public uint Flags; [FieldOffset(16)] public uint Time; [FieldOffset(24)] public IntPtr Extra;
@@ -407,6 +411,9 @@ static class Native {
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool LockWorkStation();
     [DllImport("user32.dll")] public static extern bool ReleaseCapture();
+    [DllImport("kernel32.dll")] public static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern bool Process32FirstW(IntPtr snap, ref PENTRY e);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern bool Process32NextW(IntPtr snap, ref PENTRY e);
     public delegate IntPtr LLProc(int code, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] public static extern IntPtr SetWindowsHookEx(int id, LLProc proc, IntPtr mod, uint thread);
     [DllImport("user32.dll")] public static extern bool UnhookWindowsHookEx(IntPtr hook);
@@ -1955,7 +1962,7 @@ class MemPanel : Form {
 
     public MemPanel(float scale) {
         sc = scale;
-        Wd = (int)(400 * sc); pad = (int)(10 * sc); headH = (int)(48 * sc); rowH = (int)(38 * sc); footH = (int)(52 * sc); maxRows = 10;
+        Wd = (int)(400 * sc); pad = (int)(10 * sc); headH = (int)(66 * sc); rowH = (int)(38 * sc); footH = (int)(52 * sc); maxRows = 10;
         DoubleBuffered = true;
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
@@ -1975,6 +1982,7 @@ class MemPanel : Form {
             if (front) wasFront = true;
             if (Environment.TickCount - shownAt < 300) return;
             bool down = (Native.GetAsyncKeyState(0x01) & 0x8000) != 0 || (Native.GetAsyncKeyState(0x02) & 0x8000) != 0;
+            if (busy) return;   // stay open while closing apps (their windows may take focus)
             if ((down && !Bounds.Contains(Cursor.Position)) || (wasFront && !front)) Dismiss();
         };
     }
@@ -1991,7 +1999,9 @@ class MemPanel : Form {
         if (Closed != null) Closed();
     }
 
+    Rectangle lastAnchor; int lastBarTop;
     public void Open(Rectangle anchor, int barTop) {
+        lastAnchor = anchor; lastBarTop = barTop; busy = false;
         groups.Clear(); status = "Scanning\u2026"; scanning = true; hover = -1;
         Place(anchor, barTop, 3);
         shownAt = Environment.TickCount; wasFront = false;
@@ -2076,30 +2086,123 @@ class MemPanel : Form {
     }
 
     // ---------- closing ----------
-    // Apps with a window are asked to close (they can still ask to save your work).
-    // Background-only apps have nothing to ask, so they are ended.
+    // 1. Apps with a window are asked to close (so they can ask you to save).
+    // 2. After 3 seconds, whatever is still running is ended, together with the app's own helper
+    //    processes and its launcher, so a parent can't simply start it again.
+    //    An app showing a dialog (e.g. "Save changes?") is left alone.
+    // 3. A few seconds later the list is scanned again, and apps that came back are named.
+    static Dictionary<int, int> Parents() {
+        Dictionary<int, int> map = new Dictionary<int, int>();
+        IntPtr snap = Native.CreateToolhelp32Snapshot(0x2, 0);
+        if (snap == IntPtr.Zero || snap == (IntPtr)(-1)) return map;
+        try {
+            PENTRY e = new PENTRY(); e.dwSize = (uint)Marshal.SizeOf(typeof(PENTRY));
+            if (Native.Process32FirstW(snap, ref e)) do { map[(int)e.th32ProcessID] = (int)e.th32ParentProcessID; } while (Native.Process32NextW(snap, ref e));
+        } finally { Native.CloseHandle(snap); }
+        return map;
+    }
+    static bool Alive(int pid) { try { using (Process p = Process.GetProcessById(pid)) return !p.HasExited; } catch { return false; } }
+    static bool HasDialog(Dictionary<int, bool> pids) {
+        bool found = false;
+        Native.EnumWindows(delegate(IntPtr h, IntPtr l) {
+            uint pid; Native.GetWindowThreadProcessId(h, out pid);
+            if (pids.ContainsKey((int)pid) && Native.IsWindowVisible(h)) {
+                StringBuilder c = new StringBuilder(64); Native.GetClassName(h, c, 64);
+                if (c.ToString() == "#32770") found = true;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+    static string Dir(string exe) { try { return System.IO.Path.GetDirectoryName(exe) ?? ""; } catch { return ""; } }
+    // the top process of this app: climb parents while they live in the same install folder
+    static int RootOf(int pid, Dictionary<int, int> parents, string appDir) {
+        int cur = pid, guard = 0;
+        while (guard++ < 20) {
+            int par;
+            if (!parents.TryGetValue(cur, out par) || par == 0 || par == cur) break;
+            string pe = PidPath(par);
+            if (pe.Length == 0) break;
+            string pn = System.IO.Path.GetFileNameWithoutExtension(pe).ToLowerInvariant();
+            if (Array.IndexOf(Protected, pn) >= 0) break;
+            string pd = Dir(pe);
+            // same folder, a sub-folder, or exactly one folder up (e.g. an updater next to "app-1.2"),
+            // never further: a game's launcher (Steam etc.) further up must not be closed with it
+            string up = Dir(appDir);
+            bool related = pd.StartsWith(appDir, StringComparison.OrdinalIgnoreCase) || (up.Length > 3 && string.Equals(pd, up, StringComparison.OrdinalIgnoreCase));
+            if (appDir.Length == 0 || !related) break;
+            cur = par;
+        }
+        return cur;
+    }
+    static void KillTree(int root, Dictionary<int, int> parents, Dictionary<int, bool> done) {
+        foreach (KeyValuePair<int, int> kv in parents) if (kv.Value == root && kv.Key != root && !done.ContainsKey(kv.Key)) { done[kv.Key] = true; KillTree(kv.Key, parents, done); }
+        try { using (Process p = Process.GetProcessById(root)) { p.Kill(); } } catch { }
+    }
+
+    bool busy;
     void CloseSelected() {
+        if (busy) return;
         List<MemGroup> pick = new List<MemGroup>();
         foreach (MemGroup g in groups) if (g.Checked) pick.Add(g);
         if (pick.Count == 0) return;
-        Dismiss();
+        busy = true; scanning = true; status = "Closing\u2026";
+        foreach (MemGroup g in groups) if (g.Icon != null) g.Icon.Dispose();
+        groups.Clear(); Invalidate();
         Thread th = new Thread(delegate() {
+            long before = 0; foreach (MemGroup g in pick) before += g.Bytes;
+            // 1. ask nicely
             foreach (MemGroup g in pick) {
-                bool asked = false;
                 Dictionary<int, bool> pids = new Dictionary<int, bool>();
                 foreach (int id in g.Pids) pids[id] = true;
                 Native.EnumWindows(delegate(IntPtr h, IntPtr l) {
                     uint pid; Native.GetWindowThreadProcessId(h, out pid);
-                    if (pids.ContainsKey((int)pid) && Native.IsWindowVisible(h) && Native.GetWindowTextLength(h) > 0) { Native.PostMessage(h, 0x10, IntPtr.Zero, IntPtr.Zero); asked = true; }
+                    if (pids.ContainsKey((int)pid) && Native.IsWindowVisible(h) && Native.GetWindowTextLength(h) > 0) Native.PostMessage(h, 0x10, IntPtr.Zero, IntPtr.Zero);
                     return true;
                 }, IntPtr.Zero);
-                if (asked) continue;
-                foreach (int id in g.Pids) {
-                    try { using (Process p = Process.GetProcessById(id)) p.Kill(); } catch (Exception ex) { Log.Write("free memory: could not end " + g.Key + ": " + ex.Message); }
+            }
+            for (int t = 0; t < 10; t++) {   // up to 3 s
+                bool any = false;
+                foreach (MemGroup g in pick) foreach (int id in g.Pids) if (Alive(id)) any = true;
+                if (!any) break;
+                Thread.Sleep(300);
+            }
+            // 2. end what's left, with its helpers and launcher
+            List<string> waiting = new List<string>();
+            Dictionary<int, int> parents = Parents();
+            Dictionary<int, bool> done = new Dictionary<int, bool>();
+            foreach (MemGroup g in pick) {
+                Dictionary<int, bool> alive = new Dictionary<int, bool>();
+                foreach (int id in g.Pids) if (Alive(id)) alive[id] = true;
+                if (alive.Count == 0) continue;
+                if (HasDialog(alive)) { waiting.Add(g.Name); continue; }   // asking you something: don't lose your work
+                string appDir = g.Exe != null ? Dir(g.Exe) : "";
+                foreach (int id in alive.Keys) {
+                    int root = RootOf(id, parents, appDir);
+                    if (done.ContainsKey(root)) continue;
+                    done[root] = true;
+                    KillTree(root, parents, done);
                 }
             }
+            // 3. check again
+            Thread.Sleep(2500);
+            List<MemGroup> now = Scan();
+            List<string> back = new List<string>();
+            foreach (MemGroup g in pick) foreach (MemGroup n in now) if (string.Equals(n.Key, g.Key, StringComparison.OrdinalIgnoreCase)) { back.Add(g.Name); break; }
+            long stillUsed = 0; foreach (MemGroup g in pick) foreach (MemGroup n in now) if (string.Equals(n.Key, g.Key, StringComparison.OrdinalIgnoreCase)) stillUsed += n.Bytes;
+            string msg = "Freed ~" + Size(Math.Max(0, before - stillUsed)) + ".";
+            if (waiting.Count > 0) msg += " Waiting for you in: " + string.Join(", ", waiting.ToArray()) + ".";
+            if (back.Count > 0) { msg += " Restarted by Windows or a service: " + string.Join(", ", back.ToArray()) + "."; Log.Write("free memory: came back: " + string.Join(", ", back.ToArray())); }
+            try {
+                BeginInvoke(new Action(delegate {
+                    busy = false; scanning = false;
+                    if (!Visible) { foreach (MemGroup g in now) if (g.Icon != null) g.Icon.Dispose(); return; }
+                    groups = now; status = msg;
+                    Place(lastAnchor, lastBarTop, Math.Max(1, Math.Min(groups.Count, maxRows)));
+                }));
+            } catch { busy = false; }
         });
-        th.IsBackground = true; th.Start();
+        th.IsBackground = true; th.SetApartmentState(ApartmentState.STA); th.Start();
     }
 
     // ---------- drawing ----------
@@ -2116,7 +2219,7 @@ class MemPanel : Form {
         Native.GlobalMemoryStatusEx(ref ms);
         TextRenderer.DrawText(g, "\uE945", fIcon, new Rectangle(pad + (int)(4 * sc), 0, (int)(18 * sc), (int)(30 * sc)), WARN, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
         TextRenderer.DrawText(g, "Free up memory", fTitle, new Rectangle(pad + (int)(26 * sc), 0, Wd, (int)(30 * sc)), FG, tf);
-        TextRenderer.DrawText(g, "RAM " + ms.dwMemoryLoad + "% used \u00B7 " + status, fSmall, new Rectangle(pad + (int)(26 * sc), (int)(26 * sc), Wd - 2 * pad - (int)(26 * sc), (int)(18 * sc)), DIM, tf);
+        TextRenderer.DrawText(g, "RAM " + ms.dwMemoryLoad + "% used \u00B7 " + status, fSmall, new Rectangle(pad + (int)(26 * sc), (int)(26 * sc), Wd - 2 * pad - (int)(26 * sc), (int)(36 * sc)), DIM, TextFormatFlags.NoPadding | TextFormatFlags.Top | TextFormatFlags.Left | TextFormatFlags.WordBreak | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
 
         for (int i = 0; i < groups.Count && i < maxRows; i++) {
             MemGroup m = groups[i]; Rectangle r = RowRect(i);
@@ -2137,7 +2240,7 @@ class MemPanel : Form {
             TextRenderer.DrawText(g, kind + (m.Pids.Count > 1 ? " \u00B7 " + m.Pids.Count + " processes" : ""), fSmall, new Rectangle(tx, r.Y + r.Height / 2 + (int)(1 * sc), r.Right - tx, r.Height / 2), DIM, TextFormatFlags.NoPadding | TextFormatFlags.Top | TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
             TextRenderer.DrawText(g, mem, fName, new Rectangle(r.Right - msz.Width - (int)(10 * sc), r.Y, msz.Width + 4, r.Height), m.Bytes >= 1024L * 1024 * 1024 ? WARN : FG, tf);
         }
-        if (scanning) TextRenderer.DrawText(g, "Looking at what's running\u2026", fName, RowRect(1), DIM, tf | TextFormatFlags.HorizontalCenter);
+        if (scanning) TextRenderer.DrawText(g, busy ? "Closing the apps you picked\u2026" : "Looking at what's running\u2026", fName, RowRect(1), DIM, tf | TextFormatFlags.HorizontalCenter);
 
         // footer buttons
         long sel = 0; int n = 0;
