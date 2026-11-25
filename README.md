@@ -14,7 +14,7 @@ No installer and no third-party software: it builds a small app with the C# comp
 ## Features
 
 - **Thin 28 px bar** that replaces the built-in taskbar (the real one is hidden, not removed).
-- **Solid, translucent or transparent** look: right-click an empty part of the bar to switch.
+- **Solid, translucent (frosted glass with a soft blur) or transparent** look, with a thin 10% white line on the top edge: right-click an empty part of the bar to switch.
 - **Sticky-note widget**: cream paper notes with a paperclip, on the desktop, with tasks and plain text, word wrap, colours, keep-on-top, minimise and delete.
 - **Clipboard** button that opens Windows clipboard history (Win+V).
 - **CPU and RAM usage** right on the bar; click it to open **Task Manager**.

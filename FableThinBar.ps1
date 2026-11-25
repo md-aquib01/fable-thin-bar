@@ -2937,6 +2937,82 @@ class Bar : Form {
     }
     protected override void OnLocationChanged(EventArgs e) { base.OnLocationChanged(e); if (layeredMode) RenderLayered(); }
     protected override void OnSizeChanged(EventArgs e) { base.OnSizeChanged(e); if (layeredMode) RenderLayered(); }
+    // ---------- frosted background for "translucent" ----------
+    // Windows only blurs behind a window through an undocumented trick that recent builds ignore.
+    // Nothing but the wallpaper ever sits behind the bar (it reserves its own strip of the screen),
+    // so the bar blurs that part of the wallpaper itself.
+    int[] wallStrip; string wallKey = "";
+    static string WallpaperFile() {
+        string t = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), @"Microsoft\Windows\Themes\TranscodedWallpaper");
+        if (File.Exists(t)) return t;
+        string w = Microsoft.Win32.Registry.GetValue(@"HKEY_CURRENT_USER\Control Panel\Desktop", "WallPaper", "") as string;
+        return (!string.IsNullOrEmpty(w) && File.Exists(w)) ? w : "";
+    }
+    static Color DesktopColor() {
+        try {
+            string v = Microsoft.Win32.Registry.GetValue(@"HKEY_CURRENT_USER\Control Panel\Colors", "Background", "0 0 0") as string;
+            string[] p = (v ?? "0 0 0").Split(' ');
+            return Color.FromArgb(int.Parse(p[0]), int.Parse(p[1]), int.Parse(p[2]));
+        } catch { return Color.Black; }
+    }
+    int[] WallStrip(int W, int H) {
+        string file = "";
+        try { file = WallpaperFile(); } catch { }
+        string style = "", tile = "";
+        try {
+            style = Microsoft.Win32.Registry.GetValue(@"HKEY_CURRENT_USER\Control Panel\Desktop", "WallpaperStyle", "10") as string ?? "10";
+            tile = Microsoft.Win32.Registry.GetValue(@"HKEY_CURRENT_USER\Control Panel\Desktop", "TileWallpaper", "0") as string ?? "0";
+        } catch { }
+        string key = file + "|" + (file.Length > 0 ? File.GetLastWriteTimeUtc(file).Ticks.ToString() : "") + "|" + style + tile + "|" + Bounds;
+        if (wallStrip != null && key == wallKey) return wallStrip;
+        int m = (int)(10 * scale), SH = H + 2 * m, r = Math.Max(2, (int)(5 * scale));   // a little blur
+        int[] px = new int[W * SH];
+        try {
+            using (Bitmap strip = new Bitmap(W, SH, PixelFormat.Format32bppArgb))
+            using (Graphics g = Graphics.FromImage(strip)) {
+                g.Clear(DesktopColor());
+                if (file.Length > 0) {
+                    using (MemoryStream ms = new MemoryStream(File.ReadAllBytes(file)))
+                    using (Image img = Image.FromStream(ms)) {
+                        Rectangle scr = Screen.PrimaryScreen.Bounds;
+                        float iw = img.Width, ih = img.Height;
+                        RectangleF dest;
+                        if (style == "2") dest = new RectangleF(scr.X, scr.Y, scr.Width, scr.Height);                                     // stretch
+                        else if (style == "6") { float k = Math.Min(scr.Width / iw, scr.Height / ih); dest = new RectangleF(scr.X + (scr.Width - iw * k) / 2, scr.Y + (scr.Height - ih * k) / 2, iw * k, ih * k); }   // fit
+                        else if (style == "0" && tile != "1") dest = new RectangleF(scr.X + (scr.Width - iw) / 2, scr.Y + (scr.Height - ih) / 2, iw, ih);   // centre
+                        else { float k = Math.Max(scr.Width / iw, scr.Height / ih); dest = new RectangleF(scr.X + (scr.Width - iw * k) / 2, scr.Y + (scr.Height - ih * k) / 2, iw * k, ih * k); }   // fill (default)
+                        g.TranslateTransform(-Left, -(Top - m));
+                        g.InterpolationMode = InterpolationMode.Bilinear;
+                        if (style == "0" && tile == "1") { using (TextureBrush tb = new TextureBrush(img)) g.FillRectangle(tb, Left, Top - m, W, SH); }
+                        else g.DrawImage(img, dest);
+                    }
+                }
+                Rectangle rc = new Rectangle(0, 0, W, SH);
+                BitmapData bd = strip.LockBits(rc, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+                Marshal.Copy(bd.Scan0, px, 0, px.Length); strip.UnlockBits(bd);
+            }
+            for (int pass = 0; pass < 3; pass++) { BoxBlur(px, W, SH, r, true); BoxBlur(px, W, SH, r, false); }   // 3 box passes ~ gaussian
+        } catch (Exception ex) { Log.Write("wallpaper blur: " + ex.Message); }
+        int[] outp = new int[W * H];
+        Array.Copy(px, m * W, outp, 0, W * H);
+        wallStrip = outp; wallKey = key;
+        return wallStrip;
+    }
+    static void BoxBlur(int[] p, int W, int H, int r, bool horiz) {
+        int len = horiz ? W : H, lines = horiz ? H : W;
+        int[] rr = new int[len], gg = new int[len], bb = new int[len];
+        for (int l = 0; l < lines; l++) {
+            for (int k = 0; k < len; k++) { int v = p[horiz ? l * W + k : k * W + l]; rr[k] = (v >> 16) & 255; gg[k] = (v >> 8) & 255; bb[k] = v & 255; }
+            int sr = 0, sg = 0, sb = 0, win = 2 * r + 1;
+            for (int k = -r; k <= r; k++) { int c = Math.Max(0, Math.Min(len - 1, k)); sr += rr[c]; sg += gg[c]; sb += bb[c]; }
+            for (int k = 0; k < len; k++) {
+                p[horiz ? l * W + k : k * W + l] = (255 << 24) | ((sr / win) << 16) | ((sg / win) << 8) | (sb / win);
+                int add = Math.Min(len - 1, k + r + 1), rem = Math.Max(0, k - r);
+                sr += rr[add] - rr[rem]; sg += gg[add] - gg[rem]; sb += bb[add] - bb[rem];
+            }
+        }
+    }
+
     void RenderLayered() {
         layerPending = false;
         if (!layeredMode || !IsHandleCreated) return;
@@ -2954,16 +3030,26 @@ class Bar : Form {
             int[] pa = new int[n], pb = new int[n];
             BitmapData da = a.LockBits(rc, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb); Marshal.Copy(da.Scan0, pa, 0, n); a.UnlockBits(da);
             BitmapData db = b.LockBits(rc, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb); Marshal.Copy(db.Scan0, pb, 0, n); b.UnlockBits(db);
-            // tint under everything: translucent = dark glass, transparent = almost nothing (but never 0, or clicks would fall through)
-            int ta = style == 1 ? 165 : 2, tr = 18, tg = 18, tbl = 20;
+            // what sits under the text and icons:
+            //   translucent = blurred wallpaper under a dark tint (solid, so it looks like frosted glass)
+            //   transparent = almost nothing (never 0, or clicks would fall through to the desktop)
+            int ta = style == 1 ? 255 : 2, tr = 18, tg = 18, tbl = 20;
+            int[] wall = style == 1 ? WallStrip(W, H) : null;
+            const int TINT = 150;   // how dark the glass is (0-255)
             int[] po = new int[n];
             for (int y = 0; y < H; y++) {
-                int rta = ta, rtr = tr, rtg = tg, rtb = tbl;
-                if (y == 0 && style == 1) {   // 1px top edge: white at 10%
-                    rtr = (255 * 26 + tr * 229) / 255; rtg = (255 * 26 + tg * 229) / 255; rtb = (255 * 26 + tbl * 229) / 255;
-                    rta = ta + 26 * (255 - ta) / 255;
-                }
                 for (int x = 0, i = y * W; x < W; x++, i++) {
+                    int rta = ta, rtr = tr, rtg = tg, rtb = tbl;
+                    if (wall != null) {
+                        int wv = wall[i];
+                        rtr = (((wv >> 16) & 255) * (255 - TINT) + tr * TINT) / 255;
+                        rtg = (((wv >> 8) & 255) * (255 - TINT) + tg * TINT) / 255;
+                        rtb = ((wv & 255) * (255 - TINT) + tbl * TINT) / 255;
+                    }
+                    if (y == 0) {   // 1px top edge: white at 10%
+                        rtr = (255 * 26 + rtr * 229) / 255; rtg = (255 * 26 + rtg * 229) / 255; rtb = (255 * 26 + rtb * 229) / 255;
+                        rta = rta + 26 * (255 - rta) / 255;
+                    }
                     int A = pa[i], B = pb[i];
                     int ar = (A >> 16) & 255, ag = (A >> 8) & 255, ab = A & 255;
                     int br = (B >> 16) & 255, bg = (B >> 8) & 255, bb = B & 255;
