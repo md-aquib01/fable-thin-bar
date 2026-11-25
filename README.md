@@ -21,7 +21,6 @@ No installer and no third-party software: it builds a small app with the C# comp
 - **On/off options**: turn the CPU and RAM readout on or off, and exit the bar from its right-click menu.
 - **Very low memory use**: no background services, a lightweight CPU reading instead of performance counters, cached icons, and unused memory is handed back to Windows.
 - **Pinned apps and open windows** with live hover previews, drag to reorder, and pinning from the Start menu.
-- **Free up memory** (bolt icon): lists the apps using the most RAM; tick the ones you don't need and close them in one click. Windows itself and security tools are never listed.
 - **Drag and drop** files onto apps to open them, or onto the **recycle bin** icon to delete them.
 - **Quick search (Win+Space)**: a search box in the middle of the screen for installed apps and Settings pages, with auto-fill as you type.
 - **Web search and pins in search**: every search ends with "Search the web" (or "Open site" for an address), which opens in your default browser. Right-click a result (or press Ctrl+P) to pin it: pinned items appear as soon as the box opens and rank first; apps can also be pinned to the taskbar from there.

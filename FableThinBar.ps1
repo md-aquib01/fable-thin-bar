@@ -370,10 +370,6 @@ using System.Windows.Forms;
 [StructLayout(LayoutKind.Sequential)] struct APPBARDATA { public int cbSize; public IntPtr hWnd; public uint uCallbackMessage; public uint uEdge; public RECT rc; public IntPtr lParam; }
 [StructLayout(LayoutKind.Sequential)] struct PSIZE { public int W, H; }
 [StructLayout(LayoutKind.Sequential)] struct PT { public int X, Y; }
-[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct PENTRY {
-    public uint dwSize, cntUsage, th32ProcessID; public IntPtr th32DefaultHeapID; public uint th32ModuleID, cntThreads, th32ParentProcessID;
-    public int pcPriClassBase; public uint dwFlags; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string szExeFile;
-}
 [StructLayout(LayoutKind.Explicit, Size = 40)] struct KINPUT {
     [FieldOffset(0)] public int Type; [FieldOffset(8)] public ushort Vk; [FieldOffset(10)] public ushort Scan;
     [FieldOffset(12)] public uint Flags; [FieldOffset(16)] public uint Time; [FieldOffset(24)] public IntPtr Extra;
@@ -411,9 +407,6 @@ static class Native {
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool LockWorkStation();
     [DllImport("user32.dll")] public static extern bool ReleaseCapture();
-    [DllImport("kernel32.dll")] public static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern bool Process32FirstW(IntPtr snap, ref PENTRY e);
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern bool Process32NextW(IntPtr snap, ref PENTRY e);
     public delegate IntPtr LLProc(int code, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] public static extern IntPtr SetWindowsHookEx(int id, LLProc proc, IntPtr mod, uint thread);
     [DllImport("user32.dll")] public static extern bool UnhookWindowsHookEx(IntPtr hook);
@@ -1922,362 +1915,6 @@ class Launcher : Form {
     }
 }
 
-// ====================== Free up memory (bolt button) ======================
-class MemGroup {
-    public string Name, Exe, Key;
-    public long Bytes;
-    public List<int> Pids = new List<int>();
-    public bool HasWindow, Checked;
-    public Bitmap Icon;
-}
-
-class MemPanel : Form {
-    static readonly Color BG = Color.FromArgb(32, 32, 32);
-    static readonly Color ROWH = Color.FromArgb(48, 48, 48);
-    static readonly Color BORDER = Color.FromArgb(70, 70, 70);
-    static readonly Color FG = Color.FromArgb(240, 240, 240);
-    static readonly Color DIM = Color.FromArgb(150, 150, 150);
-    static readonly Color ACCENT = Color.FromArgb(96, 165, 250);
-    static readonly Color WARN = Color.FromArgb(250, 190, 90);
-
-    // never offered: Windows itself, security, drivers, and this app
-    static readonly string[] Protected = {
-        "system", "idle", "registry", "smss", "csrss", "wininit", "winlogon", "services", "lsass", "lsaiso", "svchost", "dwm", "explorer",
-        "fontdrvhost", "sihost", "ctfmon", "taskhostw", "runtimebroker", "searchhost", "searchindexer", "searchapp", "startmenuexperiencehost",
-        "shellexperiencehost", "textinputhost", "lockapp", "applicationframehost", "dllhost", "conhost", "audiodg", "spoolsv", "wudfhost",
-        "msmpeng", "nissrv", "securityhealthservice", "securityhealthsystray", "smartscreen", "sgrmbroker", "memory compression", "secure system",
-        "dashost", "wlanext", "useroobebroker", "systemsettingsbroker", "widgets", "widgetservice", "crossdevicesvc", "phoneexperiencehost",
-        "igfxem", "igfxcuiservice", "nvcontainer", "nvdisplay.container", "atiesrxx", "atieclxx", "rtkauduservice64", "fablethinbar"
-    };
-
-    float sc; int Wd, pad, headH, rowH, footH, maxRows;
-    Font fTitle, fName, fSmall, fIcon;
-    List<MemGroup> groups = new List<MemGroup>();
-    int hover = -1; bool hoverBtn, scanning;
-    string status = "";
-    Rectangle btnR, cancelR;
-    System.Windows.Forms.Timer watch;
-    int shownAt; bool wasFront;
-    public Action Closed;
-
-    public MemPanel(float scale) {
-        sc = scale;
-        Wd = (int)(400 * sc); pad = (int)(10 * sc); headH = (int)(66 * sc); rowH = (int)(38 * sc); footH = (int)(52 * sc); maxRows = 10;
-        DoubleBuffered = true;
-        FormBorderStyle = FormBorderStyle.None;
-        ShowInTaskbar = false;
-        StartPosition = FormStartPosition.Manual;
-        TopMost = true;
-        KeyPreview = true;
-        BackColor = BG;
-        fTitle = new Font("Segoe UI Semibold", 10.5f);
-        fName = new Font("Segoe UI", 9.5f);
-        fSmall = new Font("Segoe UI", 8.5f);
-        fIcon = new Font("Segoe MDL2 Assets", 9f);
-        watch = new System.Windows.Forms.Timer();
-        watch.Interval = 50;
-        watch.Tick += delegate {
-            if (!Visible) { watch.Stop(); return; }
-            bool front = Native.GetForegroundWindow() == Handle;
-            if (front) wasFront = true;
-            if (Environment.TickCount - shownAt < 300) return;
-            bool down = (Native.GetAsyncKeyState(0x01) & 0x8000) != 0 || (Native.GetAsyncKeyState(0x02) & 0x8000) != 0;
-            if (busy) return;   // stay open while closing apps (their windows may take focus)
-            if ((down && !Bounds.Contains(Cursor.Position)) || (wasFront && !front)) Dismiss();
-        };
-    }
-    protected override CreateParams CreateParams {
-        get { CreateParams cp = base.CreateParams; cp.ExStyle |= 0x80 | 0x8; cp.ClassStyle |= 0x20000; return cp; }   // tool window, on top, shadow
-    }
-    protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); Ui.Corners(Handle); }
-
-    public void Dismiss() {
-        if (!Visible) return;
-        Hide(); watch.Stop();
-        foreach (MemGroup g in groups) if (g.Icon != null) g.Icon.Dispose();   // keep nothing around while closed
-        groups.Clear();
-        if (Closed != null) Closed();
-    }
-
-    Rectangle lastAnchor; int lastBarTop;
-    public void Open(Rectangle anchor, int barTop) {
-        lastAnchor = anchor; lastBarTop = barTop; busy = false;
-        groups.Clear(); status = "Scanning\u2026"; scanning = true; hover = -1;
-        Place(anchor, barTop, 3);
-        shownAt = Environment.TickCount; wasFront = false;
-        Show();
-        Bar.Activate(Handle);
-        watch.Start();
-        Rectangle a = anchor; int bt = barTop;
-        Thread th = new Thread(delegate() {
-            List<MemGroup> found = Scan();
-            try {
-                BeginInvoke(new Action(delegate {
-                    if (!Visible) { foreach (MemGroup g in found) if (g.Icon != null) g.Icon.Dispose(); return; }
-                    groups = found; scanning = false;
-                    status = groups.Count == 0 ? "Nothing big to close right now." : "Tick the apps you want to close.";
-                    Place(a, bt, Math.Max(1, Math.Min(groups.Count, maxRows)));
-                }));
-            } catch { }
-        });
-        th.IsBackground = true; th.SetApartmentState(ApartmentState.STA); th.Start();
-    }
-
-    void Place(Rectangle anchor, int barTop, int rows) {
-        int H = headH + rows * rowH + footH;
-        Rectangle scr = Screen.FromRectangle(anchor).Bounds;
-        int x = anchor.Left + anchor.Width / 2 - Wd / 2;
-        x = Math.Max(scr.Left + 8, Math.Min(x, scr.Right - Wd - 8));
-        Bounds = new Rectangle(x, barTop - H - (int)(6 * sc), Wd, H);
-        Invalidate();
-    }
-
-    // ---------- scanning ----------
-    static List<MemGroup> Scan() {
-        Dictionary<int, bool> withWindow = new Dictionary<int, bool>();
-        Native.EnumWindows(delegate(IntPtr h, IntPtr l) {
-            if (Native.IsWindowVisible(h) && Native.GetWindowTextLength(h) > 0) {
-                uint pid; Native.GetWindowThreadProcessId(h, out pid);
-                withWindow[(int)pid] = true;
-            }
-            return true;
-        }, IntPtr.Zero);
-
-        int me = Process.GetCurrentProcess().Id, session = Process.GetCurrentProcess().SessionId;
-        Dictionary<string, MemGroup> map = new Dictionary<string, MemGroup>(StringComparer.OrdinalIgnoreCase);
-        foreach (Process p in Process.GetProcesses()) {
-            try {
-                if (p.Id == me || p.SessionId != session) continue;   // only your own apps, not services
-                string pn = p.ProcessName;
-                if (Array.IndexOf(Protected, pn.ToLowerInvariant()) >= 0) continue;
-                long ws = p.WorkingSet64;
-                MemGroup g;
-                if (!map.TryGetValue(pn, out g)) { g = new MemGroup(); g.Key = pn; g.Name = pn; map[pn] = g; }
-                g.Bytes += ws; g.Pids.Add(p.Id);
-                if (withWindow.ContainsKey(p.Id)) g.HasWindow = true;
-                if (g.Exe == null) {
-                    string exe = PidPath(p.Id);
-                    if (exe.Length > 0) {
-                        g.Exe = exe;
-                        try { string d = FileVersionInfo.GetVersionInfo(exe).FileDescription; if (!string.IsNullOrEmpty(d) && d.Trim().Length > 1) g.Name = d.Trim(); } catch { }
-                    }
-                }
-            } catch { }
-            finally { p.Dispose(); }
-        }
-        List<MemGroup> list = new List<MemGroup>();
-        foreach (MemGroup g in map.Values) if (g.Bytes >= 60L * 1024 * 1024) list.Add(g);   // only things using 60 MB or more
-        list.Sort(delegate(MemGroup a, MemGroup b) { return b.Bytes.CompareTo(a.Bytes); });
-        if (list.Count > 10) list.RemoveRange(10, list.Count - 10);
-        foreach (MemGroup g in list) {
-            if (g.Exe != null) try { using (Icon ic = Icon.ExtractAssociatedIcon(g.Exe)) { if (ic != null) { Bitmap b = new Bitmap(16, 16); using (Graphics gr = Graphics.FromImage(b)) { gr.InterpolationMode = InterpolationMode.HighQualityBicubic; gr.DrawIcon(ic, new Rectangle(0, 0, 16, 16)); } g.Icon = b; } } } catch { }
-        }
-        return list;
-    }
-    static string PidPath(int pid) {
-        IntPtr ph = Native.OpenProcess(0x1000, false, (uint)pid);
-        if (ph == IntPtr.Zero) return "";
-        try { StringBuilder sb = new StringBuilder(1024); int n = sb.Capacity; return Native.QueryFullProcessImageName(ph, 0, sb, ref n) ? sb.ToString() : ""; }
-        finally { Native.CloseHandle(ph); }
-    }
-    static string Size(long b) {
-        if (b >= 1024L * 1024 * 1024) return (b / (1024.0 * 1024 * 1024)).ToString("0.0") + " GB";
-        return (b / (1024 * 1024)) + " MB";
-    }
-
-    // ---------- closing ----------
-    // 1. Apps with a window are asked to close (so they can ask you to save).
-    // 2. After 3 seconds, whatever is still running is ended, together with the app's own helper
-    //    processes and its launcher, so a parent can't simply start it again.
-    //    An app showing a dialog (e.g. "Save changes?") is left alone.
-    // 3. A few seconds later the list is scanned again, and apps that came back are named.
-    static Dictionary<int, int> Parents() {
-        Dictionary<int, int> map = new Dictionary<int, int>();
-        IntPtr snap = Native.CreateToolhelp32Snapshot(0x2, 0);
-        if (snap == IntPtr.Zero || snap == (IntPtr)(-1)) return map;
-        try {
-            PENTRY e = new PENTRY(); e.dwSize = (uint)Marshal.SizeOf(typeof(PENTRY));
-            if (Native.Process32FirstW(snap, ref e)) do { map[(int)e.th32ProcessID] = (int)e.th32ParentProcessID; } while (Native.Process32NextW(snap, ref e));
-        } finally { Native.CloseHandle(snap); }
-        return map;
-    }
-    static bool Alive(int pid) { try { using (Process p = Process.GetProcessById(pid)) return !p.HasExited; } catch { return false; } }
-    static bool HasDialog(Dictionary<int, bool> pids) {
-        bool found = false;
-        Native.EnumWindows(delegate(IntPtr h, IntPtr l) {
-            uint pid; Native.GetWindowThreadProcessId(h, out pid);
-            if (pids.ContainsKey((int)pid) && Native.IsWindowVisible(h)) {
-                StringBuilder c = new StringBuilder(64); Native.GetClassName(h, c, 64);
-                if (c.ToString() == "#32770") found = true;
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-    static string Dir(string exe) { try { return System.IO.Path.GetDirectoryName(exe) ?? ""; } catch { return ""; } }
-    // the top process of this app: climb parents while they live in the same install folder
-    static int RootOf(int pid, Dictionary<int, int> parents, string appDir) {
-        int cur = pid, guard = 0;
-        while (guard++ < 20) {
-            int par;
-            if (!parents.TryGetValue(cur, out par) || par == 0 || par == cur) break;
-            string pe = PidPath(par);
-            if (pe.Length == 0) break;
-            string pn = System.IO.Path.GetFileNameWithoutExtension(pe).ToLowerInvariant();
-            if (Array.IndexOf(Protected, pn) >= 0) break;
-            string pd = Dir(pe);
-            // same folder, a sub-folder, or exactly one folder up (e.g. an updater next to "app-1.2"),
-            // never further: a game's launcher (Steam etc.) further up must not be closed with it
-            string up = Dir(appDir);
-            bool related = pd.StartsWith(appDir, StringComparison.OrdinalIgnoreCase) || (up.Length > 3 && string.Equals(pd, up, StringComparison.OrdinalIgnoreCase));
-            if (appDir.Length == 0 || !related) break;
-            cur = par;
-        }
-        return cur;
-    }
-    static void KillTree(int root, Dictionary<int, int> parents, Dictionary<int, bool> done) {
-        foreach (KeyValuePair<int, int> kv in parents) if (kv.Value == root && kv.Key != root && !done.ContainsKey(kv.Key)) { done[kv.Key] = true; KillTree(kv.Key, parents, done); }
-        try { using (Process p = Process.GetProcessById(root)) { p.Kill(); } } catch { }
-    }
-
-    bool busy;
-    void CloseSelected() {
-        if (busy) return;
-        List<MemGroup> pick = new List<MemGroup>();
-        foreach (MemGroup g in groups) if (g.Checked) pick.Add(g);
-        if (pick.Count == 0) return;
-        busy = true; scanning = true; status = "Closing\u2026";
-        foreach (MemGroup g in groups) if (g.Icon != null) g.Icon.Dispose();
-        groups.Clear(); Invalidate();
-        Thread th = new Thread(delegate() {
-            long before = 0; foreach (MemGroup g in pick) before += g.Bytes;
-            // 1. ask nicely
-            foreach (MemGroup g in pick) {
-                Dictionary<int, bool> pids = new Dictionary<int, bool>();
-                foreach (int id in g.Pids) pids[id] = true;
-                Native.EnumWindows(delegate(IntPtr h, IntPtr l) {
-                    uint pid; Native.GetWindowThreadProcessId(h, out pid);
-                    if (pids.ContainsKey((int)pid) && Native.IsWindowVisible(h) && Native.GetWindowTextLength(h) > 0) Native.PostMessage(h, 0x10, IntPtr.Zero, IntPtr.Zero);
-                    return true;
-                }, IntPtr.Zero);
-            }
-            for (int t = 0; t < 10; t++) {   // up to 3 s
-                bool any = false;
-                foreach (MemGroup g in pick) foreach (int id in g.Pids) if (Alive(id)) any = true;
-                if (!any) break;
-                Thread.Sleep(300);
-            }
-            // 2. end what's left, with its helpers and launcher
-            List<string> waiting = new List<string>();
-            Dictionary<int, int> parents = Parents();
-            Dictionary<int, bool> done = new Dictionary<int, bool>();
-            foreach (MemGroup g in pick) {
-                Dictionary<int, bool> alive = new Dictionary<int, bool>();
-                foreach (int id in g.Pids) if (Alive(id)) alive[id] = true;
-                if (alive.Count == 0) continue;
-                if (HasDialog(alive)) { waiting.Add(g.Name); continue; }   // asking you something: don't lose your work
-                string appDir = g.Exe != null ? Dir(g.Exe) : "";
-                foreach (int id in alive.Keys) {
-                    int root = RootOf(id, parents, appDir);
-                    if (done.ContainsKey(root)) continue;
-                    done[root] = true;
-                    KillTree(root, parents, done);
-                }
-            }
-            // 3. check again
-            Thread.Sleep(2500);
-            List<MemGroup> now = Scan();
-            List<string> back = new List<string>();
-            foreach (MemGroup g in pick) foreach (MemGroup n in now) if (string.Equals(n.Key, g.Key, StringComparison.OrdinalIgnoreCase)) { back.Add(g.Name); break; }
-            long stillUsed = 0; foreach (MemGroup g in pick) foreach (MemGroup n in now) if (string.Equals(n.Key, g.Key, StringComparison.OrdinalIgnoreCase)) stillUsed += n.Bytes;
-            string msg = "Freed ~" + Size(Math.Max(0, before - stillUsed)) + ".";
-            if (waiting.Count > 0) msg += " Waiting for you in: " + string.Join(", ", waiting.ToArray()) + ".";
-            if (back.Count > 0) { msg += " Restarted by Windows or a service: " + string.Join(", ", back.ToArray()) + "."; Log.Write("free memory: came back: " + string.Join(", ", back.ToArray())); }
-            try {
-                BeginInvoke(new Action(delegate {
-                    busy = false; scanning = false;
-                    if (!Visible) { foreach (MemGroup g in now) if (g.Icon != null) g.Icon.Dispose(); return; }
-                    groups = now; status = msg;
-                    Place(lastAnchor, lastBarTop, Math.Max(1, Math.Min(groups.Count, maxRows)));
-                }));
-            } catch { busy = false; }
-        });
-        th.IsBackground = true; th.SetApartmentState(ApartmentState.STA); th.Start();
-    }
-
-    // ---------- drawing ----------
-    Rectangle RowRect(int i) { return new Rectangle(pad, headH + i * rowH, Wd - 2 * pad, rowH); }
-
-    protected override void OnPaint(PaintEventArgs e) {
-        Graphics g = e.Graphics;
-        g.Clear(BG);
-        g.SmoothingMode = SmoothingMode.AntiAlias;
-        using (Pen bp = new Pen(BORDER)) g.DrawRectangle(bp, 0, 0, ClientSize.Width - 1, ClientSize.Height - 1);
-        TextFormatFlags tf = TextFormatFlags.NoPadding | TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix;
-
-        MEMSTATUS ms = new MEMSTATUS(); ms.dwLength = (uint)Marshal.SizeOf(typeof(MEMSTATUS));
-        Native.GlobalMemoryStatusEx(ref ms);
-        TextRenderer.DrawText(g, "\uE945", fIcon, new Rectangle(pad + (int)(4 * sc), 0, (int)(18 * sc), (int)(30 * sc)), WARN, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
-        TextRenderer.DrawText(g, "Free up memory", fTitle, new Rectangle(pad + (int)(26 * sc), 0, Wd, (int)(30 * sc)), FG, tf);
-        TextRenderer.DrawText(g, "RAM " + ms.dwMemoryLoad + "% used \u00B7 " + status, fSmall, new Rectangle(pad + (int)(26 * sc), (int)(26 * sc), Wd - 2 * pad - (int)(26 * sc), (int)(36 * sc)), DIM, TextFormatFlags.NoPadding | TextFormatFlags.Top | TextFormatFlags.Left | TextFormatFlags.WordBreak | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
-
-        for (int i = 0; i < groups.Count && i < maxRows; i++) {
-            MemGroup m = groups[i]; Rectangle r = RowRect(i);
-            if (i == hover) using (GraphicsPath p = Ui.Round(r, (int)(5 * sc))) using (SolidBrush b = new SolidBrush(ROWH)) g.FillPath(b, p);
-            int cb = (int)(16 * sc);
-            Rectangle box = new Rectangle(r.X + (int)(8 * sc), r.Y + (r.Height - cb) / 2, cb, cb);
-            using (GraphicsPath p = Ui.Round(box, (int)(3 * sc))) {
-                if (m.Checked) using (SolidBrush b = new SolidBrush(ACCENT)) g.FillPath(b, p);
-                else using (Pen pn = new Pen(DIM, 1.2f * sc)) g.DrawPath(pn, p);
-            }
-            if (m.Checked) TextRenderer.DrawText(g, "\uE73E", fSmall, box, Color.Black, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
-            int ix = box.Right + (int)(10 * sc), isz = (int)(16 * sc);
-            if (m.Icon != null) g.DrawImage(m.Icon, new Rectangle(ix, r.Y + (r.Height - isz) / 2, isz, isz));
-            int tx = ix + isz + (int)(10 * sc);
-            string mem = Size(m.Bytes), kind = m.HasWindow ? "open window" : "background";
-            Size msz = TextRenderer.MeasureText(mem, fName);
-            TextRenderer.DrawText(g, m.Name, fName, new Rectangle(tx, r.Y + (int)(2 * sc), r.Right - tx - msz.Width - (int)(16 * sc), r.Height / 2 + (int)(2 * sc)), FG, TextFormatFlags.NoPadding | TextFormatFlags.Bottom | TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
-            TextRenderer.DrawText(g, kind + (m.Pids.Count > 1 ? " \u00B7 " + m.Pids.Count + " processes" : ""), fSmall, new Rectangle(tx, r.Y + r.Height / 2 + (int)(1 * sc), r.Right - tx, r.Height / 2), DIM, TextFormatFlags.NoPadding | TextFormatFlags.Top | TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
-            TextRenderer.DrawText(g, mem, fName, new Rectangle(r.Right - msz.Width - (int)(10 * sc), r.Y, msz.Width + 4, r.Height), m.Bytes >= 1024L * 1024 * 1024 ? WARN : FG, tf);
-        }
-        if (scanning) TextRenderer.DrawText(g, busy ? "Closing the apps you picked\u2026" : "Looking at what's running\u2026", fName, RowRect(1), DIM, tf | TextFormatFlags.HorizontalCenter);
-
-        // footer buttons
-        long sel = 0; int n = 0;
-        foreach (MemGroup m in groups) if (m.Checked) { sel += m.Bytes; n++; }
-        int by = ClientSize.Height - footH + (int)(10 * sc), bh = footH - (int)(20 * sc);
-        cancelR = new Rectangle(Wd - pad - (int)(80 * sc), by, (int)(80 * sc), bh);
-        btnR = new Rectangle(pad, by, cancelR.X - pad - (int)(8 * sc), bh);
-        using (GraphicsPath p = Ui.Round(btnR, (int)(5 * sc))) using (SolidBrush b = new SolidBrush(n > 0 ? (hoverBtn ? Color.FromArgb(120, 180, 255) : ACCENT) : Color.FromArgb(60, 60, 60))) g.FillPath(b, p);
-        string label = n > 0 ? "Close " + n + (n == 1 ? " app" : " apps") + " \u00B7 frees ~" + Size(sel) : "Select apps to close";
-        TextRenderer.DrawText(g, label, fName, btnR, n > 0 ? Color.Black : DIM, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
-        using (GraphicsPath p = Ui.Round(cancelR, (int)(5 * sc))) using (Pen pn = new Pen(BORDER)) g.DrawPath(pn, p);
-        TextRenderer.DrawText(g, "Cancel", fName, cancelR, FG, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
-    }
-
-    protected override void OnMouseMove(MouseEventArgs e) {
-        int h = -1;
-        for (int i = 0; i < groups.Count && i < maxRows; i++) if (RowRect(i).Contains(e.Location)) { h = i; break; }
-        bool hb = btnR.Contains(e.Location);
-        if (h != hover || hb != hoverBtn) { hover = h; hoverBtn = hb; Cursor = (h >= 0 || hb || cancelR.Contains(e.Location)) ? Cursors.Hand : Cursors.Default; Invalidate(); }
-        base.OnMouseMove(e);
-    }
-    protected override void OnMouseLeave(EventArgs e) { hover = -1; hoverBtn = false; Invalidate(); base.OnMouseLeave(e); }
-    protected override void OnMouseUp(MouseEventArgs e) {
-        if (e.Button == MouseButtons.Left) {
-            for (int i = 0; i < groups.Count && i < maxRows; i++) if (RowRect(i).Contains(e.Location)) { groups[i].Checked = !groups[i].Checked; Invalidate(); return; }
-            if (btnR.Contains(e.Location)) { CloseSelected(); return; }
-            if (cancelR.Contains(e.Location)) { Dismiss(); return; }
-        }
-        base.OnMouseUp(e);
-    }
-    protected override void OnKeyDown(KeyEventArgs e) {
-        if (e.KeyCode == Keys.Escape) Dismiss();
-        else if (e.KeyCode == Keys.Enter) CloseSelected();
-        base.OnKeyDown(e);
-    }
-}
-
 // Hover preview popup: live DWM thumbnails of one or more windows, shown above the bar.
 class Preview : Form {
     static readonly Color BG = Color.FromArgb(32, 32, 32);
@@ -2506,7 +2143,6 @@ class Bar : Form {
     int pendSince, leaveSince; bool leaving, trayOpen, trayShown;
     PopMenu pop; int popClosedAt; Rectangle powerR = Rectangle.Empty;
     Rectangle binR = Rectangle.Empty; long binItems; volatile bool binStale;
-    Rectangle boltR = Rectangle.Empty; MemPanel memPanel; int memClosedAt;
     // drag to arrange: group 0 = pinned icons, group 1 = open-window buttons
     int dragGroup = -1, dragFrom = -1, dragTo = -1, dragX, pinX0, pinSlot, winX0, winSlot;
     bool dragging; Point downPt;
@@ -3357,16 +2993,6 @@ class Bar : Form {
         OpenPop(m);
     }
 
-    // ---------- free up memory ----------
-    void BoltClick(MouseButtons b) {
-        if (b != MouseButtons.Left) return;
-        if (memPanel != null && memPanel.Visible) { memPanel.Dismiss(); return; }
-        if (Environment.TickCount - memClosedAt < 300) return;   // this very click just closed it
-        HidePreview(); ClosePop();
-        if (memPanel == null) { memPanel = new MemPanel(scale); memPanel.Closed = delegate { memClosedAt = Environment.TickCount; }; }
-        memPanel.Open(RectangleToScreen(boltR), Bounds.Top);
-    }
-
     // ---------- recycle bin ----------
     void QueryBin() {
         binStale = false;
@@ -3584,8 +3210,7 @@ class Bar : Form {
         // Right-hand status segments
         List<Seg> segs = new List<Seg>();
         int gap = (int)(12 * scale), tight = (int)(8 * scale);
-        Seg sBolt = new Seg(); sBolt.T = "\uE945"; sBolt.F = icons; sBolt.C = ramVal >= 80 ? Color.FromArgb(250, 190, 90) : FG; sBolt.Pad = 0; sBolt.A = BoltClick; segs.Add(sBolt);
-        Seg sBin = new Seg(); sBin.T = "\uE74D"; sBin.F = icons; sBin.C = binItems > 0 ? FG : DIM; sBin.Pad = tight; sBin.A = BinClick; segs.Add(sBin);
+        Seg sBin = new Seg(); sBin.T = "\uE74D"; sBin.F = icons; sBin.C = binItems > 0 ? FG : DIM; sBin.Pad = 0; sBin.A = BinClick; segs.Add(sBin);
         Seg s0 = new Seg(); s0.T = trayShown ? "\uE70D" : "\uE70E"; s0.F = icons; s0.C = FG; s0.Pad = tight; s0.A = TrayClick; segs.Add(s0);
         Seg s1 = new Seg(); s1.T = "CPU " + (int)cpuVal + "%"; s1.F = font; s1.C = DIM; s1.Pad = tight; s1.A = OpenTaskMgr; if (showStats) segs.Add(s1);
         Seg s2 = new Seg(); s2.T = "RAM " + ramVal + "%"; s2.F = font; s2.C = DIM; s2.Pad = gap; s2.A = OpenTaskMgr; if (showStats) segs.Add(s2);
@@ -3618,7 +3243,6 @@ class Bar : Form {
             Hit h = new Hit(); h.R = wr; h.A = s.A; hits.Add(h);
             if (s == sPw) powerR = wr;
             if (s == sBin) binR = wr;
-            if (s == sBolt) boltR = wr;
             if (s == s0) trayArrowR = wr;
             if (s == sNote) noteR = wr;
             x += s.W;
