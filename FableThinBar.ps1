@@ -1586,6 +1586,12 @@ class Launcher : Form {
     int sel, hover = -1;
     bool deleting, filling, loading, wasFront;
     int shownAt, focusTries;
+    // pinned search items (shown when the box opens, and ranked first), saved by path
+    List<string> pins = new List<string>();
+    string pinsFile = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FableThinBar\\searchpins.txt");
+    PopMenu menu; bool menuWasOpen;
+    public Action<string> PinToBar;        // set by the bar: pin a program to the taskbar
+    public Func<string, bool> IsBarPinned;
     DateTime loadedAt = DateTime.MinValue;
     System.Windows.Forms.Timer watch;
 
@@ -1604,6 +1610,7 @@ class Launcher : Form {
         fKind = new Font("Segoe UI", 8.5f);
         fIcon = new Font("Segoe MDL2 Assets", 13f);
         settings = AppIndex.Settings();
+        try { if (File.Exists(pinsFile)) foreach (string l in File.ReadAllLines(pinsFile)) if (l.Trim().Length > 0 && !pins.Contains(l.Trim())) pins.Add(l.Trim()); } catch { }
         try {
             string cd = AppIndex.CustomDir();
             if (!Directory.Exists(cd)) Directory.CreateDirectory(cd);
@@ -1632,6 +1639,9 @@ class Launcher : Form {
         watch.Interval = 40;
         watch.Tick += delegate {
             if (!Visible) { watch.Stop(); return; }
+            bool menuOpen = menu != null && menu.Visible;
+            if (menuOpen) { menuWasOpen = true; return; }
+            if (menuWasOpen) { menuWasOpen = false; wasFront = false; focusTries = 0; shownAt = Environment.TickCount; ForceFront(); return; }   // menu closed: take focus back
             bool front = Native.GetForegroundWindow() == Handle;
             // Windows sometimes refuses the first attempt to bring us forward: keep trying for about half a second
             if (!front && !wasFront && focusTries < 12) { focusTries++; ForceFront(); return; }
@@ -1676,13 +1686,14 @@ class Launcher : Form {
     }
 
     public void Toggle() {
-        if (Visible) { Hide(); return; }
+        if (Visible) { Hide(); if (menu != null) menu.Hide(); return; }
         Rectangle wa = Screen.PrimaryScreen.WorkingArea;
         Location = new Point(wa.Left + (wa.Width - Wd) / 2, wa.Top + (int)(wa.Height * 0.22));
         filling = true; tb.Text = ""; filling = false;
         results.Clear(); sel = 0; hover = -1;
         ResizeTo(0);
         shownAt = Environment.TickCount; focusTries = 0; wasFront = false;
+        OnQuery();   // empty box: shows your pinned items
         Show();
         ForceFront();
         tb.Focus();
@@ -1707,26 +1718,57 @@ class Launcher : Form {
         return t.Trim().ToLowerInvariant();
     }
 
+    string RawQuery() {
+        string t = tb.Text;
+        if (tb.SelectionLength > 0 && tb.SelectionStart + tb.SelectionLength == t.Length) t = t.Substring(0, tb.SelectionStart);
+        return t.Trim();
+    }
+    bool IsPinned(SearchItem it) { return it.Path != null && pins.Contains(it.Path); }
+    SearchItem FindByPath(string path) {
+        foreach (SearchItem it in custom) if (it.Path == path) return it;
+        foreach (SearchItem it in apps) if (it.Path == path) return it;
+        foreach (SearchItem it in settings) if (it.Path == path) return it;
+        return null;
+    }
+    static bool LooksLikeSite(string q) {
+        if (q.IndexOf(' ') >= 0 || q.IndexOf('.') <= 0 || q.EndsWith(".")) return false;
+        if (q.StartsWith("http://", StringComparison.OrdinalIgnoreCase) || q.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) return true;
+        string host = q.Split('/')[0];
+        string tld = host.Substring(host.LastIndexOf('.') + 1);
+        return tld.Length >= 2 && tld.Length <= 12 && System.Text.RegularExpressions.Regex.IsMatch(host, @"^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$");
+    }
+    static SearchItem WebItem(string name, string url) {
+        SearchItem w = new SearchItem(); w.Name = name; w.Path = url; w.Kind = "Web";
+        return w;
+    }
+
     void OnQuery() {
         if (filling) return;
-        string q = Query();
+        string q = Query(), raw = RawQuery();
         List<KeyValuePair<int, SearchItem>> hits = new List<KeyValuePair<int, SearchItem>>();
-        if (q.Length > 0) {
-            foreach (SearchItem it in custom) { int s = AppIndex.Score(it, q); if (s > 0) hits.Add(new KeyValuePair<int, SearchItem>(s, it)); }
-            foreach (SearchItem it in apps) { int s = AppIndex.Score(it, q); if (s > 0) hits.Add(new KeyValuePair<int, SearchItem>(s, it)); }
-            foreach (SearchItem it in settings) { int s = AppIndex.Score(it, q); if (s > 0) hits.Add(new KeyValuePair<int, SearchItem>(s, it)); }
+        results.Clear();
+        if (q.Length == 0) {
+            foreach (string pth in pins) { SearchItem it = FindByPath(pth); if (it != null && results.Count < maxRows) results.Add(it); }
+        } else {
+            foreach (SearchItem it in custom) { int s = AppIndex.Score(it, q); if (s > 0) hits.Add(new KeyValuePair<int, SearchItem>(s + (IsPinned(it) ? 150 : 0), it)); }
+            foreach (SearchItem it in apps) { int s = AppIndex.Score(it, q); if (s > 0) hits.Add(new KeyValuePair<int, SearchItem>(s + (IsPinned(it) ? 150 : 0), it)); }
+            foreach (SearchItem it in settings) { int s = AppIndex.Score(it, q); if (s > 0) hits.Add(new KeyValuePair<int, SearchItem>(s + (IsPinned(it) ? 150 : 0), it)); }
             hits.Sort(delegate(KeyValuePair<int, SearchItem> a, KeyValuePair<int, SearchItem> b) {
                 int c = b.Key.CompareTo(a.Key);
                 return c != 0 ? c : string.Compare(a.Value.Name, b.Value.Name, StringComparison.OrdinalIgnoreCase);
             });
+            // web rows go last: open the address if it looks like one, otherwise search in the default browser
+            List<SearchItem> web = new List<SearchItem>();
+            if (LooksLikeSite(raw)) web.Add(WebItem("Open " + raw, raw.StartsWith("http", StringComparison.OrdinalIgnoreCase) ? raw : "https://" + raw));
+            web.Add(WebItem("Search the web for \u201C" + raw + "\u201D", "https://www.google.com/search?q=" + Uri.EscapeDataString(raw)));
+            for (int i2 = 0; i2 < hits.Count && results.Count < maxRows - web.Count; i2++) results.Add(hits[i2].Value);
+            results.AddRange(web);
         }
-        results.Clear();
-        for (int i = 0; i < hits.Count && i < maxRows; i++) results.Add(hits[i].Value);
         sel = 0; hover = -1;
         ResizeTo(results.Count);
 
         // auto-fill: complete the typed text with the best match's name (selected, so typing on replaces it)
-        if (!deleting && results.Count > 0 && tb.SelectionStart == tb.Text.Length) {
+        if (!deleting && results.Count > 0 && results[0].Kind != "Web" && tb.SelectionStart == tb.Text.Length) {
             string typed = tb.Text, name = results[0].Name;
             if (typed.Length > 0 && name.Length > typed.Length && name.StartsWith(typed, StringComparison.OrdinalIgnoreCase)) {
                 filling = true;
@@ -1749,6 +1791,10 @@ class Launcher : Form {
             }
         }
         else if (e.KeyCode == Keys.Escape) { e.SuppressKeyPress = true; Hide(); }
+        else if (e.KeyCode == Keys.P && e.Control) {
+            e.SuppressKeyPress = true;
+            if (sel >= 0 && sel < results.Count && results[sel].Kind != "Web") { TogglePin(results[sel]); Invalidate(); }
+        }
         else if (e.KeyCode == Keys.Down) { e.SuppressKeyPress = true; if (results.Count > 0) { sel = (sel + 1) % results.Count; Invalidate(); } }
         else if (e.KeyCode == Keys.Up) { e.SuppressKeyPress = true; if (results.Count > 0) { sel = (sel - 1 + results.Count) % results.Count; Invalidate(); } }
         else if (e.KeyCode == Keys.Tab) { e.SuppressKeyPress = true; tb.SelectionStart = tb.TextLength; tb.SelectionLength = 0; }   // accept auto-fill
@@ -1762,7 +1808,7 @@ class Launcher : Form {
     void Open(SearchItem it) {
         Hide();
         try {
-            ProcessStartInfo psi = (it.Setting || it.Custom) ? new ProcessStartInfo(it.Path) : new ProcessStartInfo("explorer.exe", "shell:AppsFolder\\" + it.Path);
+            ProcessStartInfo psi = (it.Setting || it.Custom || it.Kind == "Web") ? new ProcessStartInfo(it.Path) : new ProcessStartInfo("explorer.exe", "shell:AppsFolder\\" + it.Path);   // web: opens in your default browser
             psi.UseShellExecute = true;
             Process.Start(psi);
         } catch (Exception ex) { Log.Write("launch " + it.Name + ": " + ex.Message); }
@@ -1792,9 +1838,10 @@ class Launcher : Form {
             }
             Rectangle ir = new Rectangle(r.X + (int)(12 * sc), r.Y + (r.Height - iconPx) / 2, iconPx, iconPx);
             if (it.Setting) TextRenderer.DrawText(g, "\uE713", fIcon, ir, FG, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            else if (it.Kind == "Web") TextRenderer.DrawText(g, it.Name.StartsWith("Open ") ? "\uE71B" : "\uE774", fIcon, ir, ACCENT, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
             else if (it.Icon != null) g.DrawImage(it.Icon, ir);
             int tx = ir.Right + (int)(12 * sc);
-            string kind = it.Kind;
+            string kind = IsPinned(it) ? "\u2022 Pinned  " + it.Kind : it.Kind;
             Size ks = TextRenderer.MeasureText(kind, fKind);
             TextRenderer.DrawText(g, it.Name, fName, new Rectangle(tx, r.Y, r.Right - tx - ks.Width - (int)(20 * sc), r.Height), FG, tf);
             TextRenderer.DrawText(g, kind, fKind, new Rectangle(r.Right - ks.Width - (int)(12 * sc), r.Y, ks.Width + 4, r.Height), DIM, tf);
@@ -1809,8 +1856,62 @@ class Launcher : Form {
     }
     protected override void OnMouseLeave(EventArgs e) { if (hover != -1) { hover = -1; Invalidate(); } base.OnMouseLeave(e); }
     protected override void OnMouseUp(MouseEventArgs e) {
-        if (e.Button == MouseButtons.Left) for (int i = 0; i < results.Count; i++) if (RowRect(i).Contains(e.Location)) { Open(results[i]); break; }
+        for (int i = 0; i < results.Count; i++) {
+            if (!RowRect(i).Contains(e.Location)) continue;
+            sel = i; Invalidate();
+            if (e.Button == MouseButtons.Left) Open(results[i]);
+            else if (e.Button == MouseButtons.Right) ItemMenu(results[i]);
+            break;
+        }
         base.OnMouseUp(e);
+    }
+
+    void SavePins() {
+        try { Directory.CreateDirectory(System.IO.Path.GetDirectoryName(pinsFile)); File.WriteAllLines(pinsFile, pins.ToArray()); } catch { }
+    }
+    void TogglePin(SearchItem it) {
+        if (IsPinned(it)) pins.Remove(it.Path); else pins.Add(it.Path);
+        SavePins();
+    }
+    // the real program behind an app, so it can go on the taskbar (Store apps have none)
+    static string ExeFor(SearchItem it) {
+        string p = it.Path ?? "";
+        if (it.Custom && p.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase)) p = Bar.ResolveLink(p);
+        else if (p.StartsWith("{")) {
+            int k = p.IndexOf('}');
+            if (k > 0) {
+                string guid = p.Substring(1, k - 1).ToUpperInvariant(), rest = p.Substring(k + 1).TrimStart('\\');
+                string root = null;
+                if (guid == "6D809377-6AF0-444B-8957-A3773F02200E") root = Environment.GetEnvironmentVariable("ProgramW6432");
+                else if (guid == "7C5A40EF-A0FB-4BFC-874A-C0F2E0B9FA8E") root = Environment.GetEnvironmentVariable("ProgramFiles(x86)");
+                else if (guid == "F38BF404-1D43-42F2-9305-67DE0B28FC23") root = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+                else if (guid == "1AC14E77-02E7-4E5D-B744-2EB1AE5198B7") root = Environment.GetFolderPath(Environment.SpecialFolder.System);
+                else if (guid == "D65231B0-B2F1-4857-A4CE-A8E7C6EA7D27") root = Environment.GetFolderPath(Environment.SpecialFolder.SystemX86);
+                else if (guid == "F1B32785-6FBA-4FCF-9D55-7B8E7F157091") root = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                else if (guid == "3EB685DB-65F9-4CF6-A03A-E3EF65729F3D") root = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+                p = root != null ? System.IO.Path.Combine(root, rest) : "";
+            }
+        }
+        return (p.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) && File.Exists(p)) ? p : "";
+    }
+    void ItemMenu(SearchItem it) {
+        if (it.Kind == "Web") return;
+        List<PopItem> m = new List<PopItem>();
+        m.Add(Ui.Item("\uE8A7", "Open", delegate { Open(it); }));
+        m.Add(Ui.Item(IsPinned(it) ? "\uE77A" : "\uE718", IsPinned(it) ? "Unpin from search" : "Pin to search", delegate { TogglePin(it); OnQuery(); }));
+        if (!it.Setting && it.Kind != "Folder" && it.Kind != "File") {
+            string exe = ExeFor(it);
+            if (exe.Length > 0 && PinToBar != null) {
+                bool onBar = IsBarPinned != null && IsBarPinned(exe);
+                PopItem pb = Ui.Item("\uE840", onBar ? "Already on the taskbar" : "Pin to taskbar", delegate { PinToBar(exe); });
+                if (onBar) pb.Disabled = true;
+                m.Add(pb);
+            }
+        }
+        if (it.Custom) m.Add(Ui.Item("\uE838", "Show in folder", delegate { Hide(); try { Process.Start("explorer.exe", "/select,\"" + it.Path + "\""); } catch { } }));
+        if (menu == null) menu = new PopMenu(sc);
+        Point c = Cursor.Position;
+        menu.Open(m, new Rectangle(c.X, c.Y, 1, 1), c.Y);
     }
 }
 
@@ -2114,6 +2215,8 @@ class Bar : Form {
         RegisterBar();
         ApplyStyle();
         launcher = new Launcher(scale);
+        launcher.PinToBar = delegate(string exe) { Pin(exe); };
+        launcher.IsBarPinned = delegate(string exe) { return IsPinned(exe); };
         IntPtr lh = launcher.Handle;   // create it now so the app list can load in the background
         launcher.Refresh(true);
         SetSearchKey(searchKey);
@@ -2394,7 +2497,7 @@ class Bar : Form {
             File.WriteAllLines(nativeFile, rows.ToArray());
         } catch { }
     }
-    static string ResolveLink(string lnk) {
+    public static string ResolveLink(string lnk) {
         object sh = null, sc = null;
         try {
             Type t = Type.GetTypeFromProgID("WScript.Shell");

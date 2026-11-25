@@ -23,6 +23,7 @@ No installer and no third-party software: it builds a small app with the C# comp
 - **Pinned apps and open windows** with live hover previews, drag to reorder, and pinning from the Start menu.
 - **Drag and drop** files onto apps to open them, or onto the **recycle bin** icon to delete them.
 - **Quick search (Win+Space)**: a search box in the middle of the screen for installed apps and Settings pages, with auto-fill as you type.
+- **Web search and pins in search**: every search ends with "Search the web" (or "Open site" for an address), which opens in your default browser. Right-click a result (or press Ctrl+P) to pin it: pinned items appear as soon as the box opens and rank first; apps can also be pinned to the taskbar from there.
 - **Your own search items**: anything you put in `Documents\Thinbar Search` (files, folders, shortcuts, websites) shows up in search, listed first.
 - **Tray**: hidden-icons popup, Wi-Fi, volume, battery, clock, Settings and a power menu (Lock, Restart, Shut down).
 
