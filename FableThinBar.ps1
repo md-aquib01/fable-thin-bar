@@ -619,6 +619,23 @@ static class Ui {
         p.CloseFigure();
         return p;
     }
+    public static void Layered(IntPtr h, Bitmap bmp, Point pos) {
+        IntPtr scr = Native.GetDC(IntPtr.Zero), mem = Native.CreateCompatibleDC(scr), hb = IntPtr.Zero, old = IntPtr.Zero;
+        try {
+            hb = bmp.GetHbitmap(Color.FromArgb(0));
+            old = Native.SelectObject(mem, hb);
+            PSIZE sz = new PSIZE(); sz.W = bmp.Width; sz.H = bmp.Height;
+            PT dst = new PT(); dst.X = pos.X; dst.Y = pos.Y;
+            PT src = new PT();
+            BLEND bf = new BLEND(); bf.Op = 0; bf.Flags = 0; bf.Alpha = 255; bf.Format = 1;   // AC_SRC_OVER, AC_SRC_ALPHA
+            Native.UpdateLayeredWindow(h, scr, ref dst, ref sz, mem, ref src, 0, ref bf, 2);   // ULW_ALPHA
+        } finally {
+            if (old != IntPtr.Zero) Native.SelectObject(mem, old);
+            if (hb != IntPtr.Zero) Native.DeleteObject(hb);
+            Native.DeleteDC(mem);
+            Native.ReleaseDC(IntPtr.Zero, scr);
+        }
+    }
     public static PopItem Item(string icon, string text, Action a) { PopItem p = new PopItem(); p.Icon = icon; p.Text = text; p.A = a; return p; }
     public static PopItem Sep() { PopItem p = new PopItem(); p.Sep = true; return p; }
     // Windows 11: ask DWM for rounded window corners (silently ignored on Windows 10).
@@ -2895,14 +2912,77 @@ class Bar : Form {
             Native.SetWindowCompositionAttribute(h, ref d);
         } finally { Marshal.FreeHGlobal(ptr); }
     }
+    // Solid: normal drawing. Translucent / transparent: the bar becomes a per-pixel-alpha window.
+    // Text drawn by Windows has no transparency of its own, so the bar is drawn twice (on black and on white)
+    // and the difference gives every pixel's exact see-through amount; then it's laid over a tint.
+    bool layeredMode, layerPending;
+    Color paintBg = BG;
     void ApplyStyle() {
         try {
-            if (style == 1) SetAccent(Handle, 3, unchecked((int)0x99141414));   // blur + dark tint (ABGR)
-            else if (style == 2) SetAccent(Handle, 2, 0x01000000);              // clear
-            else SetAccent(Handle, 0, 0);                                       // solid
-            BackColor = (style == 0) ? BG : Color.Black;
-        } catch (Exception ex) { Log.Write("style: " + ex); }
-        Invalidate();
+            SetAccent(Handle, 0, 0);
+            int ex = Native.GetWindowLong(Handle, -20);
+            if (style == 0) {
+                if (layeredMode) { layeredMode = false; Native.SetWindowLong(Handle, -20, ex & ~0x80000); }
+                BackColor = BG; paintBg = BG;
+                Invalidate(true); Update();
+            } else {
+                if (!layeredMode) { Native.SetWindowLong(Handle, -20, ex | 0x80000); layeredMode = true; }
+                RenderLayered();
+            }
+        } catch (Exception ex2) { Log.Write("style: " + ex2); }
+    }
+    protected override void OnInvalidated(InvalidateEventArgs e) {
+        base.OnInvalidated(e);
+        if (layeredMode && !layerPending && IsHandleCreated) { layerPending = true; BeginInvoke(new Action(RenderLayered)); }   // many redraw requests -> one render
+    }
+    protected override void OnLocationChanged(EventArgs e) { base.OnLocationChanged(e); if (layeredMode) RenderLayered(); }
+    protected override void OnSizeChanged(EventArgs e) { base.OnSizeChanged(e); if (layeredMode) RenderLayered(); }
+    void RenderLayered() {
+        layerPending = false;
+        if (!layeredMode || !IsHandleCreated) return;
+        int W = ClientSize.Width, H = ClientSize.Height;
+        if (W <= 0 || H <= 0) return;
+        Bitmap a = null, b = null, o = null;
+        try {
+            a = new Bitmap(W, H, PixelFormat.Format32bppArgb);
+            b = new Bitmap(W, H, PixelFormat.Format32bppArgb);
+            Rectangle rc = new Rectangle(0, 0, W, H);
+            paintBg = Color.Black; using (Graphics g = Graphics.FromImage(a)) PaintBar(new PaintEventArgs(g, rc));
+            paintBg = Color.White; using (Graphics g = Graphics.FromImage(b)) PaintBar(new PaintEventArgs(g, rc));
+            paintBg = BG;
+            int n = W * H;
+            int[] pa = new int[n], pb = new int[n];
+            BitmapData da = a.LockBits(rc, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb); Marshal.Copy(da.Scan0, pa, 0, n); a.UnlockBits(da);
+            BitmapData db = b.LockBits(rc, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb); Marshal.Copy(db.Scan0, pb, 0, n); b.UnlockBits(db);
+            // tint under everything: translucent = dark glass, transparent = almost nothing (but never 0, or clicks would fall through)
+            int ta = style == 1 ? 165 : 2, tr = 18, tg = 18, tbl = 20;
+            int[] po = new int[n];
+            for (int y = 0; y < H; y++) {
+                int rta = ta, rtr = tr, rtg = tg, rtb = tbl;
+                if (y == 0 && style == 1) {   // 1px top edge: white at 10%
+                    rtr = (255 * 26 + tr * 229) / 255; rtg = (255 * 26 + tg * 229) / 255; rtb = (255 * 26 + tbl * 229) / 255;
+                    rta = ta + 26 * (255 - ta) / 255;
+                }
+                for (int x = 0, i = y * W; x < W; x++, i++) {
+                    int A = pa[i], B = pb[i];
+                    int ar = (A >> 16) & 255, ag = (A >> 8) & 255, ab = A & 255;
+                    int br = (B >> 16) & 255, bg = (B >> 8) & 255, bb = B & 255;
+                    int al = 255 - ((br - ar) + (bg - ag) + (bb - ab)) / 3;
+                    if (al < 0) al = 0; if (al > 255) al = 255;
+                    int cr = 0, cg = 0, cb = 0;
+                    if (al > 0) { cr = Math.Min(255, ar * 255 / al); cg = Math.Min(255, ag * 255 / al); cb = Math.Min(255, ab * 255 / al); }
+                    int oa = al + rta * (255 - al) / 255;
+                    if (oa <= 0) { po[i] = 0; continue; }
+                    int under = rta * (255 - al) / 255;
+                    int orr = (cr * al + rtr * under) / oa, og = (cg * al + rtg * under) / oa, ob = (cb * al + rtb * under) / oa;
+                    po[i] = (oa << 24) | (orr << 16) | (og << 8) | ob;
+                }
+            }
+            o = new Bitmap(W, H, PixelFormat.Format32bppArgb);
+            BitmapData dout = o.LockBits(rc, ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb); Marshal.Copy(po, 0, dout.Scan0, n); o.UnlockBits(dout);
+            Ui.Layered(Handle, o, Location);
+        } catch (Exception ex) { Log.Write("layered paint: " + ex.Message); }
+        finally { paintBg = BG; if (a != null) a.Dispose(); if (b != null) b.Dispose(); if (o != null) o.Dispose(); }
     }
 
     static string UniquePath(string dir, string baseName, string ext) {
@@ -3175,11 +3255,12 @@ class Bar : Form {
 
     // ---------- drawing ----------
     protected override void OnPaint(PaintEventArgs e) {
+        if (layeredMode) { RenderLayered(); return; }
         try { PaintBar(e); } catch (Exception ex) { Log.Write("paint: " + ex); }
     }
     void PaintBar(PaintEventArgs e) {
         Graphics g = e.Graphics;
-        if (style == 0) g.Clear(BG); else g.Clear(Color.FromArgb(0, 0, 0, 0));   // see-through styles leave the background empty
+        g.Clear(paintBg);   // BG when solid; black, then white, for the two passes of the see-through styles
         hits.Clear();
         int H = ClientSize.Height, W = ClientSize.Width;
 
@@ -3189,9 +3270,6 @@ class Bar : Form {
                 g.FillRectangle(fb, 0, 0, W, H);
             using (SolidBrush tb = new SolidBrush(Color.FromArgb(26, 255, 255, 255)))
                 g.FillRectangle(tb, 0, 0, W, 1);
-        }
-        else if (style == 1) {   // translucent: a plain light line (semi-transparent colours do not blend correctly on this kind of window)
-            using (SolidBrush tb = new SolidBrush(Color.FromArgb(255, 74, 74, 74))) g.FillRectangle(tb, 0, 0, W, 1);
         }
         TextFormatFlags tf = TextFormatFlags.NoPadding | TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix;
 
