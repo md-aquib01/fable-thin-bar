@@ -36,6 +36,9 @@ No installer and no third-party software: it builds a small app with the C# comp
 **Transparent**
 ![Transparent bar](assets/screenshots/bar-transparent.png)
 
+**Win+Space search**
+![Search box with apps, settings and web search](assets/screenshots/search.png)
+
 <p>
   <img src="assets/screenshots/sticky-note.png" width="300" alt="Sticky-note widget">
 </p>
